@@ -1,0 +1,18 @@
+# Never commit real credentials
+docker-compose.yml
+devices.json
+tinytuya.json
+snapshot.json
+*.local.yml
+.env
+
+# Logs and dumps
+*.log
+*.json.bak
+ep2500_full.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

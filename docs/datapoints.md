@@ -1,0 +1,201 @@
+# Oukitel EP2500 – Tuya datapoints (DP)
+
+Derived from local communication via TinyTuya (protocol 3.5) and cross-checked
+against the Smart Life app display. Status: September 2026, firmware per
+DP 107/108 = 1.02 / 1.17.
+
+The device reports 83 datapoints. No data model is registered in the Tuya cloud
+(`functions: []`), so all mappings below were established by observation.
+
+*A note on the app labels: my app runs in German, so the English labels quoted
+here are my translations. If yours differ slightly, go by the position in the
+menu.*
+
+---
+
+## Confirmed – control (writable)
+
+| DP | Meaning | Unit | App label | Confidence |
+|---|---|---|---|---|
+| 118 | Backflow prevention – blocks **export** | bool | Anti-backflow | certain |
+| 119 | Off-grid socket on/off | bool | – | certain |
+| 120 | Anti-backflow grid regulation | W | same | meaning unclear |
+| 121 | Max. feed-in power | W | Maximum allowable feed-in power | certain |
+| 122 | Max. battery charge power **total** (PV + grid) | W | Maximum allowable battery charging power | certain |
+| 123 | Charge stop SoC | % | Charge stop SOC | certain |
+| 124 | Discharge stop SoC | % | Discharge stop SOC | certain |
+| 156 | PV charge power currently in effect | W | – | certain |
+| 157 | PV charge power 2 (schedule) | W | PV charging power 2 | certain |
+| 162 | PV charge power 3 (other time) | W | PV charging power 3 | certain |
+| 158 / 159 | PV schedule 1: start / end | h | Time1 start / over time | certain |
+| 160 / 161 | PV schedule 2: start / end | h | Time2 start / over time | certain |
+| 170 / 171 | Mode schedule 1: start / end | h | Time1 | certain |
+| 172 / 173 | Mode schedule 2: start / end | h | Time2 | certain |
+| 174 / 175 | Mode schedule 3: start / end | h | Time3 | certain |
+| 176 / 177 | Mode schedule 4: start / end | h | Time4 | certain |
+| 165–169 | Operating mode 1–5 (169 = other time) | enum | Operating mode 1–5 | certain |
+
+Known enum values for the operating mode: `grid_priority`, `backup_power`.
+There may be more that were not triggered during testing.
+
+**Note on DP 156:** the value follows whichever schedule slot is currently
+active. It is the PV charge power actually in effect. No separate datapoint was
+found for PV charge power 1 – possibly identical with 156.
+
+**Note on DP 122:** this is the single most important value on the device. It
+limits the total battery charge power, from PV as well as from the grid. Set to
+0, the device shuts down its MPPT controllers and takes no solar energy at all,
+even with an empty battery and full sun. See the section on quirks below.
+
+---
+
+## Confirmed – measurements (read-only)
+
+| DP | Meaning | Scaling | Confidence |
+|---|---|---|---|
+| 102 | Battery SoC | % | certain |
+| 105 | Serial number | string | certain |
+| 117 | Operating mode currently in effect | enum | certain |
+| 125 / 126 | PV yield today (resets at midnight) | Wh | certain |
+| 127 | Total pack voltage | ÷100 → V | certain |
+| 128 | Battery power (negative = discharging) | W | certain |
+| 130 | Highest single cell voltage | mV | certain |
+| 131 | Lowest single cell voltage | mV | certain |
+| 132 / 133 | Cell temperatures (highest / lowest) | ÷10 → °C | certain |
+| 134 | Status: `charge_status` / `discharge_status` / `standy_status` | enum | certain |
+| 135 | Off-grid output voltage | ÷10 → V | certain |
+| 137 | Grid power (mirrors 155) | W | likely |
+| 138 | Grid frequency | ÷100 → Hz | certain |
+| 139 | Grid voltage | ÷10 → V | certain |
+| 141 / 142 | Off-grid socket load, both registers identical | W | certain |
+| 143 | Total PV power | W | certain |
+| 155 | AC output power (**excluding** off-grid load) | W | certain |
+
+### MPPT strings
+
+Power, voltage and current are not contiguous in the address space:
+
+| String | Power (W) | Voltage (÷10 → V) | Current (÷100 → A) |
+|---|---|---|---|
+| PV1 | 147 | 148 | 150 |
+| PV2 | 164 | 178 | 179 |
+| PV3 | 151 | 183 | 163 |
+| PV4 | 180 | 181 | 182 |
+
+Verified repeatedly: voltage × current = power, and the four string powers sum
+to DP 143.
+
+### Firmware and identification strings
+
+| DP | Value on my unit | Guess |
+|---|---|---|
+| 107 | `1.02` | version |
+| 108 | `1.17` | version |
+| 109 | `108` | code |
+| 110 | `120` | code |
+| 112 | `2.05` | version |
+| 113 | `1.01` | version |
+| 114 | `1.01` | version, briefly drops to `0.00` during reconnects |
+| 184 | `106` | code |
+| 103 / 104 / 106 | masked strings | device model / device code / inverter code |
+
+---
+
+## Still unknown
+
+| DP | Observed behaviour | Guess |
+|---|---|---|
+| 101 | bool, briefly flips to `true`, usually together with 114 and 149 | update flag? |
+| 111 | constant 0 | – |
+| 115 | empty string | – |
+| 116 | constant 0 | – |
+| 129 | counter; once ran from 0 to 13 in 20 s, then reset to 0 | grid sync timer? |
+| 136 | varies (7 … 35), no correlation found | – |
+| 140 | values 0–4 and 14 observed. 1 after disconnecting from the grid, 0 after switching the off-grid socket off, 2/3 alternating during operation, 14 under off-grid load | bitmask for the inverter state? |
+| 144 | constant 0 | – |
+| 145 / 152 / 153 | empty strings | – |
+| 149 | alternates between 0 and 2, often together with 101 and 114 | – |
+| 154 | constant `false` | – |
+
+Also present in the app but not mapped to any datapoint: **battery status**,
+**battery protection**, **system fault** (storage menu), and **AC output
+voltage** and **current** (load menu).
+
+---
+
+## Quirks worth knowing
+
+### 1. DP 122 disables PV harvesting
+
+The label "maximum allowable battery charging power" does not suggest that the
+value also governs PV charging. With DP 122 at 0 the device takes no solar
+energy at all: open-circuit voltage is present at the MPPT inputs (around 37 V)
+but no current flows (0.01 A). The device goes to standby because it has
+nothing to do – and in standby it does not harvest.
+
+This behaviour is fully reversible and reproducible: set DP 122 to 100 W and
+the MPPT controllers start immediately, even with a nearly empty battery.
+
+For any integration: hold DP 122 permanently above your PV power. It is an
+enable, not a control variable.
+
+### 2. DP 118 blocks export, not grid charging
+
+Despite the name "backflow prevention", this refers to backflow *into the
+grid*. Enabling it stops the device from feeding in and sends it to standby. It
+has no effect on charging from the grid.
+
+I have not found a reliable way to block grid charging while allowing PV
+charging.
+
+### 3. The off-grid socket runs on a separate path
+
+The load on the off-grid socket (DP 141/142) is **not** included in the AC
+output power (DP 155) and does not appear at the grid meter. It is therefore
+invisible to any zero-export controller.
+
+Measured example: 119 W at the AC output, 298 W off-grid load at the same
+moment, battery delivering 471 W. The difference is conversion losses across
+two paths.
+
+Estimate remaining runtime from the battery power (DP 128), not from the AC
+output.
+
+### 4. 16-bit overflows in power values
+
+Under weak irradiance DP 143 returned 65535 while the four string powers summed
+to 6 W. That is −1 as a signed 16-bit integer. The same pattern appears on
+DP 142.
+
+The app displays these values unfiltered, and the device's own yield counter
+(DP 125) accumulates them: on a heavily overcast morning it read 9026 Wh where
+roughly 800 Wh was physically possible.
+
+### 5. Delta frames
+
+After the initial full status the device sends only changed datapoints.
+Anything reading with `receive()` must merge frames into a cache, otherwise
+half the values appear to be missing.
+
+### 6. One local connection only
+
+The device accepts a single local connection at a time. Opening the app
+disconnects any integration running in parallel, and vice versa.
+
+---
+
+## Method
+
+- **Settings:** change one value at a time in the app, then compare the full
+  status against a cached copy to see which DP moved. This mapped the entire
+  schedule structure without guesswork.
+- **Measurements:** simultaneous comparison with the app display, plus physical
+  cross-checks. The energy balance closes: 166 W PV + 660 W battery = 826 W in,
+  804 W at the AC output, i.e. 97 % efficiency.
+- **Cell voltages:** 51.55 V pack voltage ÷ 16 cells = 3222 mV, and DP 130/131
+  read 3232 / 3225 mV. The spread widens as the pack empties, as expected for
+  LiFePO4.
+- **Overnight logging:** cell voltages fall slowly and monotonically,
+  temperatures cool down – that is how DP 130 to 133 were identified.
+
+Corrections and additions welcome.

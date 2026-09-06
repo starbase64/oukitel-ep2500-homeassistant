@@ -1,0 +1,88 @@
+# Oukitel EP2500 – local control for Home Assistant
+
+Full local integration for the Oukitel EP2500 balcony energy storage system,
+including a zero-export controller. No cloud, no vendor app required.
+
+The EP2500 has **no data model registered in the Tuya cloud**, so no
+off-the-shelf integration works with it. This project documents the local
+datapoints and provides a bridge that exposes them to Home Assistant over MQTT.
+
+Tested against firmware 1.02 / 1.17 with an Eco Tracker as the grid meter.
+Regulation holds the grid connection at ±4 W.
+
+## What you get
+
+- 30+ sensors: SoC, all four MPPT strings individually, cell voltages,
+  temperatures, power values, off-grid load
+- Feed-in limit and battery charge limit continuously adjustable
+- Zero-export controller with anti-windup and idle detection
+- Controller parameters adjustable from the dashboard, no restart needed
+- Event log covering the last 48 hours
+- Plausibility filter for the firmware's 16-bit overflow values
+- Optional Shelly integration for an independent cross-check
+
+## Documentation
+
+- [Datapoint reference](docs/datapoints.md) – all 83 DPs, what is known and
+  what is not
+- [Setup guide](docs/setup.md) – from Tuya developer account to running
+  controller
+
+## Quick start
+
+You need the device ID, local key and IP address of your EP2500. See the
+[setup guide](docs/setup.md) for how to obtain them.
+
+```bash
+git clone https://github.com/YOUR_NAME/oukitel-ep2500-homeassistant.git
+cd oukitel-ep2500-homeassistant
+cp docker-compose.example.yml docker-compose.yml
+# edit docker-compose.yml with your values
+docker compose up -d --build
+docker logs -f ep2500-bridge
+```
+
+The entities appear in Home Assistant automatically via MQTT discovery. No HA
+restart needed.
+
+For the dashboard, create a new dashboard, open the raw configuration editor
+and paste [`dashboard.yaml`](dashboard.yaml).
+
+## Read this before anything else
+
+**DP 122 limits the total battery charge power – from PV as well as from the
+grid.** Set to 0, the device shuts down its MPPT controllers and takes no solar
+energy at all, even with an empty battery and full sun. The bridge holds this
+value open automatically; if you use your own integration, do the same.
+
+**DP 118 ("backflow prevention") blocks export, not grid charging.** Enabling
+it stops the device from feeding in and sends it to standby.
+
+Both cost me days of troubleshooting. Details in the
+[datapoint reference](docs/datapoints.md).
+
+## Caveats
+
+- The device accepts only **one local connection** at a time. Opening the
+  vendor app disconnects the bridge.
+- The 800 W feed-in cap is a software limit. The device accepts higher values
+  without complaint. `LIMIT_MAX` in the configuration is what actually caps it.
+- Writing to undocumented datapoints of a grid-tied inverter is at your own
+  risk. Grid parameters and country settings live in the same address space.
+- Multiple plug-in solar devices at one grid connection point are counted
+  together in Germany. Different phases do not multiply the allowance.
+
+## Contributing
+
+Corrections to the datapoint mapping are very welcome, especially for the ones
+still marked unknown. If you own an EP2500 and can confirm or correct something,
+please open an issue.
+
+The bridge logs and entity names are in German. A translation would be a
+welcome contribution.
+
+## License
+
+MIT – see [LICENSE](LICENSE).
+
+Not affiliated with Oukitel or Shenzhen Yunji New Energy Technology.

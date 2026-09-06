@@ -1,0 +1,54 @@
+# Copy to docker-compose.yml and fill in your values.
+# docker-compose.yml is gitignored so your credentials stay local.
+
+services:
+  ep2500-bridge:
+    build: .
+    container_name: ep2500-bridge
+    restart: unless-stopped
+    environment:
+      # --- required ---------------------------------------------------
+      EP2500_ID:    "YOUR_DEVICE_ID"
+      EP2500_IP:    "192.168.1.50"
+      EP2500_KEY:   "YOUR_LOCAL_KEY"
+      EP2500_PORT:  "6668"
+
+      MQTT_HOST:    "192.168.1.10"
+      MQTT_PORT:    "1883"
+      MQTT_USER:    ""
+      MQTT_PASS:    ""
+
+      # --- grid meter -------------------------------------------------
+      # "http" polls a meter directly, "mqtt" reads from GRID_TOPIC.
+      # Expects power in watts: positive = importing, negative = exporting.
+      GRID_SOURCE:  "http"
+      ECO_URL:      "http://192.168.1.100/status"
+      ECO_FIELD:    "power"
+      ECO_INTERVAL: "5"
+      ECO_SPIKE:    "1500"
+      # GRID_TOPIC:    "meter/power"
+      # GRID_JSON_KEY: "power"
+
+      # --- limits -----------------------------------------------------
+      # LIMIT_MAX is what actually caps the feed-in. The device itself
+      # accepts higher values without complaint.
+      LIMIT_MAX:    "800"
+      LIMIT_SAFE:   "300"
+      CHARGE_HW_MAX: "4000"
+      BATT_WH:      "2048"
+
+      # --- optional: Shelly plugs for cross-checking ------------------
+      SHELLY_IP:    ""
+      SHELLY2_IP:   ""
+      SHELLY_INTERVAL: "5"
+
+      # --- logging ----------------------------------------------------
+      # 0 = off, 1 = settings changes only, 2 = everything
+      LOG_DPS:      "1"
+      TZ:           "Europe/Berlin"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
