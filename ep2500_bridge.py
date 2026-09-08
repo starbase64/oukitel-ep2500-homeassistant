@@ -313,6 +313,7 @@ class State:
         self.dps = {}              # Cache aller bekannten Datenpunkte
         self.grid = None           # letzter Zaehlerwert in W
         self.grid_ts = 0.0
+        self.grid_verdacht = None  # noch unbestaetigter Sprungwert
         self.control_on = False    # Regelung aktiv?
         self.correction = 0        # Zielwert am Zaehler in W
         self.last_write = 0.0
@@ -885,16 +886,10 @@ def on_message(client, userdata, msg):
         val = parse_number(payload, GRID_JSON_KEY)
         if val is None:
             return
-        # Dieselben Pruefungen wie im HTTP-Pfad
-        if not math.isfinite(val) or abs(val) > ECO_ABSURD:
-            log.warning("Zaehlerwert %s unplausibel - verworfen", val)
-            return
-        with st.lock:
-            st.grid = float(val)
-            st.grid_ts = time.time()
-        # Auch bei MQTT-Quelle den Wert veroeffentlichen, sonst bleibt der
+        # Dieselbe Pruefung und Sprungerkennung wie im HTTP-Pfad. Die
+        # Funktion veroeffentlicht den Wert auch selbst, sonst bliebe der
         # Sensor "Zaehlerleistung (Regler)" in HA leer.
-        client.publish(f"{BASE}/grid", int(val))
+        zaehlerwert_uebernehmen(val, "MQTT")
         return
 
     if topic == f"{BASE}/limit/set":
@@ -1132,10 +1127,66 @@ def tuya_loop():
 # Eco Tracker (everHome Local API)
 # --------------------------------------------------------------------------
 
+def zaehlerwert_uebernehmen(val, quelle=""):
+    """Prueft einen Zaehlerwert und uebernimmt ihn in den Zustand.
+
+    Wird von beiden Quellen benutzt (HTTP-Abfrage und MQTT-Topic), damit der
+    Regler in beiden Faellen dieselbe Filterung sieht.
+
+    Zwei Stufen:
+      1. Offensichtlicher Unsinn (nicht endlich, jenseits ECO_ABSURD) fliegt
+         sofort raus.
+      2. Ein Sprung groesser als ECO_SPIKE gegenueber dem letzten gueltigen
+         Wert wird erst uebernommen, wenn die naechste Messung ihn
+         bestaetigt. Ein einzelner Ausreisser wuerde den Regler sonst auf
+         Anschlag treiben.
+
+    Rueckgabe: True, wenn der Wert uebernommen wurde.
+    """
+    if not isinstance(val, (int, float)) or isinstance(val, bool):
+        return False
+    val = float(val)
+
+    if not math.isfinite(val) or abs(val) > ECO_ABSURD:
+        log.warning("Zaehlerwert %.0f W unplausibel - verworfen%s", val,
+                    f" ({quelle})" if quelle else "")
+        return False
+
+    meldung = None      # Ereignis, nach dem Lock abzusetzen
+    sprung = None       # gesetzt, wenn auf Bestaetigung gewartet wird
+    with st.lock:
+        letzter = st.grid
+        verdacht = st.grid_verdacht
+        if (ECO_SPIKE and letzter is not None
+                and abs(val - letzter) > ECO_SPIKE):
+            if verdacht is None or abs(val - verdacht) > ECO_SPIKE:
+                st.grid_verdacht = val
+                sprung = letzter
+            else:
+                meldung = (f"Zaehlersprung bestaetigt: {letzter:+.0f} -> "
+                           f"{val:+.0f} W")
+        elif verdacht is not None:
+            meldung = (f"Ausreisser verworfen: {verdacht:+.0f} W "
+                       f"(Zaehler blieb bei {val:+.0f} W)")
+        if sprung is None:
+            st.grid_verdacht = None
+            st.grid = val
+            st.grid_ts = time.time()
+
+    # event() nimmt selbst st.lock - deshalb erst hier, nicht im Block oben.
+    if sprung is not None:
+        log.info("Zaehlersprung %.0f -> %.0f W - warte auf Bestaetigung",
+                 sprung, val)
+        return False
+    if meldung:
+        event(meldung, auch_loggen=False)
+    mqttc.publish(f"{BASE}/grid", int(val))
+    return True
+
+
 def eco_loop():
     """Fragt den Eco Tracker direkt per HTTP ab - unabhaengig von HA."""
     fails = 0
-    verdacht = None      # noch unbestaetigter Sprungwert
     while True:
         try:
             with urllib.request.urlopen(ECO_URL, timeout=5) as resp:
@@ -1156,37 +1207,10 @@ def eco_loop():
 
             val = float(val)
 
-            # Offensichtlicher Unsinn fliegt sofort raus.
-            if not math.isfinite(val) or abs(val) > ECO_ABSURD:
-                log.warning("Zaehlerwert %.0f W unplausibel - verworfen", val)
+            if not zaehlerwert_uebernehmen(val, "HTTP"):
                 time.sleep(ECO_INTERVAL)
                 continue
 
-            # Grosse Spruenge erst nach Bestaetigung durch die naechste
-            # Messung uebernehmen. Ein einzelner Ausreisser wuerde den
-            # Regler sonst auf Anschlag treiben.
-            with st.lock:
-                letzter = st.grid
-            if (ECO_SPIKE and letzter is not None
-                    and abs(val - letzter) > ECO_SPIKE):
-                if verdacht is None or abs(val - verdacht) > ECO_SPIKE:
-                    verdacht = val
-                    log.info("Zaehlersprung %.0f -> %.0f W - warte auf "
-                             "Bestaetigung", letzter, val)
-                    time.sleep(ECO_INTERVAL)
-                    continue
-                event(f"Zaehlersprung bestaetigt: {letzter:+.0f} -> "
-                      f"{val:+.0f} W", auch_loggen=False)
-            elif verdacht is not None:
-                event(f"Ausreisser verworfen: {verdacht:+.0f} W "
-                      f"(Zaehler blieb bei {val:+.0f} W)", auch_loggen=False)
-            verdacht = None
-
-            with st.lock:
-                st.grid = val
-                st.grid_ts = time.time()
-
-            mqttc.publish(f"{BASE}/grid", int(val))
             if fails >= 5:
                 event("Eco Tracker wieder erreichbar", auch_loggen=False)
             fails = 0

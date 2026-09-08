@@ -24,6 +24,9 @@ Regulation holds the grid connection at ±4 W.
 - Controller parameters adjustable from the dashboard, no restart needed
 - Event log covering the last 48 hours
 - Plausibility filter for the firmware's 16-bit overflow values
+- Meter readings are filtered the same way whichever source they come from:
+  absurd values dropped, large jumps held back until the next reading confirms
+  them
 - Optional Shelly integration for independent cross-checks
 
 ## Documentation
