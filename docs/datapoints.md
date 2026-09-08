@@ -89,17 +89,33 @@ to DP 143.
 
 ### Firmware and identification strings
 
-| DP | Value on my unit | Guess |
+All confirmed via the "Version" menu in the app:
+
+| DP | Value on my unit | Meaning |
 |---|---|---|
-| 107 | `1.02` | version |
-| 108 | `1.17` | version |
-| 109 | `108` | code |
-| 110 | `120` | code |
-| 112 | `2.05` | version |
-| 113 | `1.01` | version |
-| 114 | `1.01` | version, briefly drops to `0.00` during reconnects |
-| 184 | `106` | code |
+| 107 | `1.02` | Main control, hardware version |
+| 108 | `1.17` | Main control, software version |
+| 109 | `108` | Inverter, hardware version |
+| 110 | `120` | Inverter, software version |
+| 112 | `2.05` | BMS, software version |
+| 113 | `1.01` | Wi-Fi module, hardware version |
+| 114 | `1.01` | Wi-Fi module, software version (drops to `0.00` during reconnects) |
+| 184 | `106` | Inverter, PV software version |
 | 103 / 104 / 106 | masked strings | device model / device code / inverter code |
+
+Also confirmed, each by entering a test value in the app:
+
+| DP | Meaning |
+|---|---|
+| 115 | Energy meter serial number |
+| 145 | OTA URL for the Espressif module (hidden field) |
+| 152 | Wi-Fi name used to reach the energy meter |
+| 153 | Wi-Fi password used to reach the energy meter |
+| 154 | Network configuration switch (triggers meter pairing) |
+
+The meter appears to open its own access point named after its serial number;
+the device joins it rather than both sitting on the home network. I have not
+been able to complete the pairing yet.
 
 ---
 
@@ -109,15 +125,12 @@ to DP 143.
 |---|---|---|
 | 101 | bool, briefly flips to `true`, usually together with 114 and 149 | update flag? |
 | 111 | constant 0 | – |
-| 115 | empty string | – |
 | 116 | constant 0 | – |
 | 129 | counter; once ran from 0 to 13 in 20 s, then reset to 0 | grid sync timer? |
 | 136 | varies (7 … 35), no correlation found | – |
 
 | 144 | constant 0 | – |
-| 145 / 152 / 153 | empty strings | – |
 | 149 | alternates between 0 and 2, often together with 101 and 114 | – |
-| 154 | constant `false` | – |
 
 Also present in the app but not mapped to any datapoint: **battery status**,
 **battery protection**, **system fault** (storage menu), and **AC output

@@ -175,6 +175,12 @@ DP_NAMES = {
     "182": "PV4-I", "183": "PV3-U",
     "130": "Zelle max", "131": "Zelle min", "132": "Temperatur 1",
     "133": "Temperatur 2", "140": "Off-Grid-Strom", "141": "Off-Grid-Last",
+    "107": "HW Hauptsteuerung", "108": "SW Hauptsteuerung",
+    "109": "HW Wechselrichter", "110": "SW Wechselrichter",
+    "112": "SW BMS", "113": "HW WLAN", "114": "SW WLAN",
+    "184": "SW Wechselrichter PV", "115": "Zaehler-Seriennummer",
+    "145": "OTA-URL", "152": "WLAN-Name (Zaehler)",
+    "153": "WLAN-Passwort (Zaehler)", "154": "Netzwerkschalter",
     "142": "Off-Grid-Last (2)", "135": "Off-Grid-Spannung", "119": "Off-Grid-Steckdose",
 }
 
