@@ -18,6 +18,8 @@ Abhaengigkeiten:  pip install tinytuya paho-mqtt
 import datetime
 import json
 import logging
+import math
+import signal
 import os
 import threading
 import time
@@ -98,7 +100,12 @@ DP_PV_LIMIT = "156"        # PV-Ladeleistung, schreibbar
 
 LIMIT_MIN = 0
 LIMIT_MAX = int(os.getenv("LIMIT_MAX", "800"))   # gesetzliche Obergrenze
-LIMIT_SAFE = int(os.getenv("LIMIT_SAFE", "300")) # Fallback bei Stoerung/Ende
+LIMIT_SAFE = int(os.getenv("LIMIT_SAFE", "300")) # Fallback beim Beenden
+# Einspeisegrenze, auf die zurueckgefallen wird, wenn der Zaehler laenger
+# als GRID_MAX_AGE keine Werte liefert. 0 stoppt die Einspeisung ganz,
+# ein positiver Wert speist blind weiter. Die Batterieladegrenze bleibt
+# davon unberuehrt, damit die PV weiter laden kann.
+GRID_FAIL_LIMIT = int(os.getenv("GRID_FAIL_LIMIT", "0"))
 # Obergrenze fuer die Batterieladegrenze (DP 122). Das Geraet nimmt laut
 # Typenschild bis 4000 W ueber die vier MPPT-Eingaenge auf; der Akku selbst
 # begrenzt bei 60 A, also rund 3000 W. 2500 W ist der Vorgabewert aus der
@@ -308,6 +315,7 @@ class State:
         self.idle_logged = False   # Leerlauf-Sperre bereits gemeldet?
         self.pass_on = False       # Durchleitung freigegeben?
         self.pass_aktiv = False    # Durchleitung laeuft gerade?
+        self.grid_fail = False     # Zaehlerausfall bereits behandelt?
         self.soll = 0.0            # interner Sollwert: >0 einspeisen, <0 laden
         self.events = []           # Ereignisliste fuer das Dashboard
         self.last_status = None    # letzter Geraetestatus (fuer Ereignisse)
@@ -664,8 +672,10 @@ def on_connect(client, userdata, flags, rc, properties=None):
               f"{BASE}/socmax/set", f"{BASE}/socmin/set",
               f"{BASE}/shelly_ip/set", f"{BASE}/shelly/set",
               f"{BASE}/shelly2_ip/set", f"{BASE}/shelly2/set",
-              f"{BASE}/offgrid/set", GRID_TOPIC):
+              f"{BASE}/offgrid/set"):
         client.subscribe(t)
+    if GRID_SOURCE == "mqtt":
+        client.subscribe(GRID_TOPIC)
     client.subscribe(f"{BASE}/tune/+/set")
 
     # Retained States mitlesen, um Einstellungen nach einem Neustart
@@ -676,6 +686,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{BASE}/events")
     client.subscribe(f"{BASE}/passthrough/state")
     client.subscribe(f"{BASE}/shelly_ip")
+
+    # Nach einem MQTT-Reconnect den Verfuegbarkeitsstatus erneut senden,
+    # sonst zeigt HA die Entitaeten dauerhaft als nicht verfuegbar an.
+    client.publish(f"{BASE}/available",
+                   "online" if st.online else "offline", retain=True)
 
     threading.Timer(3.0, publish_settings).start()
 
@@ -775,9 +790,13 @@ def on_message(client, userdata, msg):
                 with _dev_lock:
                     if _dev is not None:
                         try:
-                            _dev.set_value(int(dp), val)
-                            st.merge({dp: val})
-                            event(f"{name} auf {val} % gesetzt")
+                            res = _dev.set_value(int(dp), val)
+                            ok, grund = antwort_ok(res)
+                            if ok:
+                                st.merge({dp: val})
+                                event(f"{name} auf {val} % gesetzt")
+                            else:
+                                log.warning("%s abgelehnt: %s", name, grund)
                         except Exception as exc:
                             log.error("%s setzen fehlgeschlagen: %s", name, exc)
                 publish_state()
@@ -813,8 +832,12 @@ def on_message(client, userdata, msg):
         with _dev_lock:
             if _dev is not None:
                 try:
-                    _dev.set_value(int(DP_OFFGRID), an)
-                    st.merge({DP_OFFGRID: an})
+                    res = _dev.set_value(int(DP_OFFGRID), an)
+                    ok, grund = antwort_ok(res)
+                    if ok:
+                        st.merge({DP_OFFGRID: an})
+                    else:
+                        log.warning("Off-Grid-Steckdose abgelehnt: %s", grund)
                 except Exception as exc:
                     log.error("Off-Grid-Steckdose schalten fehlgeschlagen: %s", exc)
         event("Off-Grid-Steckdose " + ("eingeschaltet" if an else "ausgeschaltet"))
@@ -824,7 +847,12 @@ def on_message(client, userdata, msg):
     if topic == f"{BASE}/charge/set":
         val = parse_number(payload)
         if val is not None:
-            set_charge(int(val), reason="manuell")
+            # Auch den gespeicherten Sollwert mitziehen, sonst setzt der
+            # Waechter die Grenze binnen 30 s wieder zurueck.
+            val = max(0, min(CHARGE_HW_MAX, int(val)))
+            st.tune["charge_limit"] = val
+            mqttc.publish(f"{BASE}/tune/charge_limit", val, retain=True)
+            set_charge(val, reason="manuell")
         return
 
     if topic == f"{BASE}/correction/state":
@@ -836,11 +864,18 @@ def on_message(client, userdata, msg):
         return
 
     if topic == GRID_TOPIC:
+        if GRID_SOURCE != "mqtt":
+            return          # HTTP-Quelle aktiv, MQTT darf sie nicht ueberschreiben
         val = parse_number(payload, GRID_JSON_KEY)
-        if val is not None:
-            with st.lock:
-                st.grid = val
-                st.grid_ts = time.time()
+        if val is None:
+            return
+        # Dieselben Pruefungen wie im HTTP-Pfad
+        if not math.isfinite(val) or abs(val) > ECO_ABSURD:
+            log.warning("Zaehlerwert %s unplausibel - verworfen", val)
+            return
+        with st.lock:
+            st.grid = float(val)
+            st.grid_ts = time.time()
         return
 
     if topic == f"{BASE}/limit/set":
@@ -883,15 +918,21 @@ def apply_tune(key, payload, source="", echo=True):
 
 
 def parse_number(payload, json_key=None):
-    """Akzeptiert '812', '812.0' oder {'power': 812}."""
+    """Akzeptiert '812', '812.0' oder {'power': 812}.
+
+    NaN und Infinity werden abgewiesen - ein spaeteres int() wuerde sonst
+    eine Exception werfen und den Regelschritt abbrechen.
+    """
     try:
-        return float(payload)
+        wert = float(payload)
+        return wert if math.isfinite(wert) else None
     except ValueError:
         pass
     try:
         data = json.loads(payload)
         if json_key and isinstance(data, dict) and json_key in data:
-            return float(data[json_key])
+            wert = float(data[json_key])
+            return wert if math.isfinite(wert) else None
     except Exception:
         pass
     log.warning("Unlesbarer Payload: %r", payload[:80])
@@ -924,23 +965,44 @@ def connect_device():
     return d
 
 
+def antwort_ok(res):
+    """Prueft die Antwort von TinyTuya auf einen Schreibvorgang.
+
+    TinyTuya wirft bei Fehlern keine Exception, sondern liefert ein Dict mit
+    einem "Error"-Schluessel zurueck. Ohne diese Pruefung wuerde ein
+    fehlgeschlagener Befehl als erfolgreich gelten und der angeforderte Wert
+    im Cache landen - Home Assistant zeigt dann etwas an, das im Geraet nie
+    angekommen ist.
+    """
+    if res is None:
+        return False, "keine Antwort"
+    if isinstance(res, dict) and "Error" in res:
+        return False, f"{res.get('Error')} (Err {res.get('Err')})"
+    return True, ""
+
+
 def write_dp(dp, watt, vmax, reason=""):
     """Schreibt einen Leistungs-Datenpunkt, hart auf 0..vmax begrenzt."""
     watt = max(0, min(vmax, int(watt)))
+    name = {DP_LIMIT: "Einspeisegrenze", DP_CHARGE: "Batterieladegrenze",
+            DP_PV_LIMIT: "PV-Grenze"}.get(dp, f"DP {dp}")
     with _dev_lock:
         if _dev is None:
             return False
         try:
             res = _dev.set_value(int(dp), watt)
         except Exception as exc:
-            log.error("Schreiben DP %s fehlgeschlagen: %s", dp, exc)
+            log.error("%s schreiben fehlgeschlagen: %s", name, exc)
             return False
+
+    ok, grund = antwort_ok(res)
+    if not ok:
+        log.warning("%s -> %s W abgelehnt: %s", name, watt, grund)
+        return False
+
     st.last_write = time.time()
     st.merge({dp: watt})
-    log.info("%s -> %s W (%s)%s",
-             {DP_LIMIT: "Einspeisegrenze", DP_CHARGE: "Batterieladegrenze",
-              DP_PV_LIMIT: "PV-Grenze"}.get(dp, f"DP {dp}"),
-             watt, reason, "" if isinstance(res, dict) else f" {res}")
+    log.info("%s -> %s W (%s)", name, watt, reason)
     return True
 
 
@@ -1047,42 +1109,6 @@ def tuya_loop():
             time.sleep(15)
 
 
-def shelly_leistung(ip):
-    """Liest die Wirkleistung eines Shelly. Gen2/Gen3 zuerst, dann Gen1."""
-    for pfad, holen in (
-        ("/rpc/Switch.GetStatus?id=0", lambda d: d.get("apower")),
-        ("/status", lambda d: (d.get("meters") or [{}])[0].get("power")),
-    ):
-        try:
-            with urllib.request.urlopen(f"http://{ip}{pfad}", timeout=4) as r:
-                wert = holen(json.loads(r.read().decode()))
-            if wert is not None:
-                return float(wert)
-        except Exception:
-            continue
-    return None
-
-
-def shelly_loop():
-    """Fragt den messenden Shelly ab und veroeffentlicht seinen Messwert."""
-    while True:
-        time.sleep(SHELLY_INTERVAL)
-        ip = st.shelly_ip
-        if not ip:
-            continue
-        wert = shelly_leistung(ip)
-        if wert is None:
-            st.shelly_fails += 1
-            if st.shelly_fails in (1, 10) or st.shelly_fails % 60 == 0:
-                log.warning("Shelly %s nicht erreichbar (%dx)", ip, st.shelly_fails)
-            mqttc.publish(f"{BASE}/shelly", "unavailable")
-            continue
-        if st.shelly_fails:
-            log.info("Shelly %s wieder erreichbar", ip)
-            st.shelly_fails = 0
-        mqttc.publish(f"{BASE}/shelly", round(wert))
-
-
 # --------------------------------------------------------------------------
 # Eco Tracker (everHome Local API)
 # --------------------------------------------------------------------------
@@ -1112,7 +1138,7 @@ def eco_loop():
             val = float(val)
 
             # Offensichtlicher Unsinn fliegt sofort raus.
-            if abs(val) > ECO_ABSURD:
+            if not math.isfinite(val) or abs(val) > ECO_ABSURD:
                 log.warning("Zaehlerwert %.0f W unplausibel - verworfen", val)
                 time.sleep(ECO_INTERVAL)
                 continue
@@ -1166,6 +1192,33 @@ def shelly_rpc(ip, pfad):
         return json.loads(resp.read().decode())
 
 
+def shelly_status(ip):
+    """Liest Leistung und Schaltzustand. Gen2/Gen3 zuerst, dann Gen1."""
+    try:
+        d = shelly_rpc(ip, "Switch.GetStatus?id=0")
+        return d.get("apower"), d.get("output")
+    except Exception:
+        pass
+    # Gen1: /status liefert meters[0].power und relays[0].ison
+    with urllib.request.urlopen(f"http://{ip}/status", timeout=4) as resp:
+        d = json.loads(resp.read().decode())
+    leistung = (d.get("meters") or [{}])[0].get("power")
+    an = (d.get("relays") or [{}])[0].get("ison")
+    return leistung, an
+
+
+def shelly_schalten_roh(ip, an):
+    """Schaltet einen Shelly. Gen2/Gen3 zuerst, dann Gen1."""
+    try:
+        shelly_schalten_roh(ip, an)
+        return
+    except Exception:
+        pass
+    url = f"http://{ip}/relay/0?turn={'on' if an else 'off'}"
+    with urllib.request.urlopen(url, timeout=4):
+        pass
+
+
 def shelly_abfragen(nr):
     """Liest Leistung und Schaltzustand eines der beiden Shellys."""
     ip = st.shelly_ip if nr == 1 else st.shelly2_ip
@@ -1174,9 +1227,7 @@ def shelly_abfragen(nr):
     if not ip:
         return
     try:
-        d = shelly_rpc(ip, "Switch.GetStatus?id=0")
-        leistung = d.get("apower")
-        an = d.get("output")
+        leistung, an = shelly_status(ip)
         with st.lock:
             if nr == 1:
                 st.shelly_power = float(leistung) if leistung is not None else None
@@ -1221,7 +1272,7 @@ def shelly_schalten(an, nr=1):
     ip = st.shelly_ip if nr == 1 else st.shelly2_ip
     name = "Shelly" if nr == 1 else "Shelly Nord-BKW"
     try:
-        shelly_rpc(ip, f"Switch.Set?id=0&on={'true' if an else 'false'}")
+        shelly_schalten_roh(ip, an)
         with st.lock:
             if nr == 1:
                 st.shelly_on = bool(an)
@@ -1240,9 +1291,10 @@ def charge_guard_loop():
     DP 122 begrenzt die Ladeleistung der Batterie insgesamt - aus PV *und*
     aus dem Netz. Steht der Wert auf 0, schaltet das Geraet die MPPT-Regler
     ab und nimmt gar keinen Solarstrom mehr auf, auch bei leerem Akku und
-    voller Sonne. Der Wert muss deshalb dauerhaft oben stehen; ob aus dem
-    Netz geladen werden darf, regelt allein die Rueckflussverhinderung
-    (DP 118).
+    voller Sonne. Der Wert muss deshalb dauerhaft oben stehen.
+
+    DP 118 (Rueckflussverhinderung) sperrt uebrigens die Einspeisung ins
+    Netz, nicht das Laden aus dem Netz - der Name ist irrefuehrend.
     """
     while True:
         time.sleep(30)
@@ -1277,10 +1329,14 @@ def set_backflow(sperren, quelle=""):
         if _dev is None:
             return False
         try:
-            _dev.set_value(int(DP_BACKFLOW), bool(sperren))
+            res = _dev.set_value(int(DP_BACKFLOW), bool(sperren))
         except Exception as exc:
             log.error("Rueckflussverhinderung schalten fehlgeschlagen: %s", exc)
             return False
+    ok, grund = antwort_ok(res)
+    if not ok:
+        log.warning("Rueckflussverhinderung abgelehnt: %s", grund)
+        return False
     st.merge({DP_BACKFLOW: bool(sperren)})
     log.info("Einspeisung %s%s", "gesperrt" if sperren else "freigegeben",
              f" ({quelle})" if quelle else "")
@@ -1308,9 +1364,23 @@ def control_loop():
             target = st.correction
 
         if grid is None or grid_age > GRID_MAX_AGE:
-            log.warning("Kein aktueller Zaehlerwert (%.0fs alt) - Regelung pausiert",
-                        grid_age if grid is not None else -1)
+            if not st.grid_fail:
+                st.grid_fail = True
+                event(f"Zaehler liefert keine Werte - Einspeisegrenze auf "
+                      f"{GRID_FAIL_LIMIT} W")
+                # Ohne Zaehlerwert kann nicht geregelt werden. Die zuletzt
+                # gesetzte Grenze einfach stehen zu lassen hiesse, blind
+                # weiterzuspeisen.
+                if st.pass_aktiv:
+                    set_pv_limit(st.tune["pv_max"], reason="Zaehlerausfall")
+                    st.pass_aktiv = False
+                set_limit(GRID_FAIL_LIMIT, reason="Zaehlerausfall")
+                st.soll = float(GRID_FAIL_LIMIT)
+                publish_state()
             continue
+        if st.grid_fail:
+            st.grid_fail = False
+            event("Zaehler liefert wieder Werte - Regelung aktiv")
 
         dps = st.snapshot()
         limit = dps.get(DP_LIMIT)
@@ -1382,7 +1452,10 @@ def control_loop():
             if not isinstance(batt, (int, float)):
                 continue
 
-            toleranz = max(20, st.tune["deadband"])
+            # Die Reserve wirkt als Totband um die Nullbilanz: kleine
+            # Abweichungen werden ignoriert, damit nicht bei jedem Wolkenzug
+            # nachgeregelt wird.
+            toleranz = max(st.tune["pass_marge"], st.tune["deadband"])
             pv_offen = st.tune["pv_max"]
 
             if batt < -toleranz:
@@ -1462,15 +1535,26 @@ def main():
     else:
         log.info("Zaehlerquelle: MQTT %s", GRID_TOPIC)
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        log.info("Beende, setze Einspeisegrenze auf %s W", LIMIT_SAFE)
-        set_limit(LIMIT_SAFE, reason="Shutdown")
-        mqttc.publish(f"{BASE}/available", "offline", retain=True)
-        time.sleep(1)
-        mqttc.loop_stop()
+    beenden = threading.Event()
+
+    def stoppen(signum, frame):
+        log.info("Signal %s empfangen", signum)
+        beenden.set()
+
+    # docker stop schickt SIGTERM - ohne Behandlung liefe das Aufraeumen nie.
+    signal.signal(signal.SIGTERM, stoppen)
+    signal.signal(signal.SIGINT, stoppen)
+
+    beenden.wait()
+
+    log.info("Beende, setze Einspeisegrenze auf %s W", LIMIT_SAFE)
+    if st.pass_aktiv:
+        # Eine von der Durchleitung gesetzte PV-Drosselung wieder oeffnen
+        set_pv_limit(st.tune["pv_max"], reason="Shutdown")
+    set_limit(LIMIT_SAFE, reason="Shutdown")
+    mqttc.publish(f"{BASE}/available", "offline", retain=True)
+    time.sleep(1)
+    mqttc.loop_stop()
 
 
 if __name__ == "__main__":

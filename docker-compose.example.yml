@@ -32,6 +32,9 @@ services:
       # --- limits -----------------------------------------------------
       # LIMIT_MAX is what actually caps the feed-in. The device itself
       # accepts higher values without complaint.
+      # Feed-in limit to fall back to when the meter stops
+      # responding. 0 stops export entirely.
+      GRID_FAIL_LIMIT: "0"
       LIMIT_MAX:    "800"
       LIMIT_SAFE:   "300"
       CHARGE_HW_MAX: "4000"
