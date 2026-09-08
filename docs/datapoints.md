@@ -56,7 +56,8 @@ even with an empty battery and full sun. See the section on quirks below.
 | 102 | Battery SoC | % | certain |
 | 105 | Serial number | string | certain |
 | 117 | Operating mode currently in effect | enum | certain |
-| 125 / 126 | PV yield today (resets at midnight) | Wh | certain |
+| 125 | PV yield today (resets at midnight) | Wh | certain |
+| 126 | PV yield total | Wh | certain |
 | 127 | Total pack voltage | ÷100 → V | certain |
 | 128 | Battery power (negative = discharging) | W | certain |
 | 130 | Highest single cell voltage | mV | certain |
@@ -68,6 +69,7 @@ even with an empty battery and full sun. See the section on quirks below.
 | 138 | Grid frequency | ÷100 → Hz | certain |
 | 139 | Grid voltage | ÷10 → V | certain |
 | 141 / 142 | Off-grid socket load, both registers identical | W | certain |
+| 140 | Off-grid output current | ÷10 → 8.7 A | certain |
 | 143 | Total PV power | W | certain |
 | 155 | AC output power (**excluding** off-grid load) | W | certain |
 
@@ -111,7 +113,7 @@ to DP 143.
 | 116 | constant 0 | – |
 | 129 | counter; once ran from 0 to 13 in 20 s, then reset to 0 | grid sync timer? |
 | 136 | varies (7 … 35), no correlation found | – |
-| 140 | values 0–4 and 14 observed. 1 after disconnecting from the grid, 0 after switching the off-grid socket off, 2/3 alternating during operation, 14 under off-grid load | bitmask for the inverter state? |
+
 | 144 | constant 0 | – |
 | 145 / 152 / 153 | empty strings | – |
 | 149 | alternates between 0 and 2, often together with 101 and 114 | – |

@@ -51,6 +51,10 @@ views:
         entities:
           - entity: switch.oukitel_ep2500_nulleinspeisung_regelung
             name: Regelung aktiv
+          - entity: switch.oukitel_ep2500_durchleitung_bei_vollem_akku
+            name: Durchleitung bei vollem Akku
+          - entity: binary_sensor.oukitel_ep2500_durchleitung_laeuft
+            name: Durchleitung läuft gerade
           - entity: switch.oukitel_ep2500_rueckflussverhinderung
             name: Rückflussverhinderung (sperrt Einspeisung)
           - entity: switch.oukitel_ep2500_off_grid_steckdose
@@ -82,8 +86,7 @@ views:
             name: Betriebszustand
           - entity: sensor.oukitel_ep2500_betriebsmodus
             name: Modus
-          - entity: sensor.oukitel_ep2500_netzstatus
-            name: Netzstatus
+
       - type: history-graph
         title: Regelverhalten (letzte 3 h)
         hours_to_show: 3
@@ -107,6 +110,12 @@ views:
             name: Akku
       - type: markdown
         title: Ereignisse (48 h)
+        card_mod:
+          style: |
+            ha-card {
+              max-height: 400px;
+              overflow-y: auto;
+            }
         content: >-
           {% set liste = state_attr('sensor.oukitel_ep2500_ereignisse',
           'eintraege') %}
@@ -122,8 +131,10 @@ views:
         entities:
           - entity: sensor.oukitel_ep2500_pv_leistung
             name: PV gesamt
-          - entity: sensor.oukitel_ep2500_pv_ertrag
+          - entity: sensor.oukitel_ep2500_pv_ertrag_heute
             name: PV-Ertrag heute
+          - entity: sensor.oukitel_ep2500_pv_ertrag_gesamt
+            name: PV-Ertrag gesamt
           - entity: sensor.oukitel_ep2500_pv_grenze
             name: PV-Ladegrenze
           - entity: sensor.oukitel_ep2500_ac_ausgangsleistung
@@ -134,6 +145,8 @@ views:
             name: Off-Grid-Last
           - entity: sensor.oukitel_ep2500_off_grid_spannung
             name: Off-Grid-Spannung
+          - entity: sensor.oukitel_ep2500_off_grid_strom
+            name: Off-Grid-Strom
       - type: entities
         title: PV-Strings
         show_header_toggle: false
@@ -216,3 +229,9 @@ views:
             name: Totband
           - entity: number.oukitel_ep2500_max_schrittweite
             name: Max. Schritt
+          - entity: number.oukitel_ep2500_durchleitung_ab_soc
+            name: Durchleitung ab SoC
+          - entity: number.oukitel_ep2500_durchleitung_reserve
+            name: Durchleitung Reserve
+          - entity: number.oukitel_ep2500_pv_grenze_offen
+            name: PV-Grenze offen

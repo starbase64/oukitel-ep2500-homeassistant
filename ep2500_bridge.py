@@ -94,6 +94,7 @@ DP_OFFGRID = "119"         # Off-Grid-Steckdose ein/aus, schreibbar
 DP_BACKFLOW = "118"        # Rueckflussverhinderung: True = keine Einspeisung
 DP_SOC_MAX = "123"         # Lade-Stopp-SoC in %
 DP_SOC_MIN = "124"         # Entlade-Stopp-SoC in %
+DP_PV_LIMIT = "156"        # PV-Ladeleistung, schreibbar
 
 LIMIT_MIN = 0
 LIMIT_MAX = int(os.getenv("LIMIT_MAX", "800"))   # gesetzliche Obergrenze
@@ -113,6 +114,9 @@ TUNABLES = {
     "deadband": ("Totband",          0,   200, 5,   "W", int),
     "max_step": ("Max. Schrittweite", 10,  800, 10,  "W", int),
     "charge_limit": ("Batterieladegrenze", 0, CHARGE_HW_MAX, 100, "W", int),
+    "soc_pass":  ("Durchleitung ab SoC", 50, 100, 1, "%", int),
+    "pass_marge": ("Durchleitung Reserve", 0, 300, 10, "W", int),
+    "pv_max":    ("PV-Grenze offen", 500, 4000, 100, "W", int),
 }
 
 TUNE_DEFAULTS = {
@@ -121,6 +125,9 @@ TUNE_DEFAULTS = {
     "deadband": 15,
     "max_step": 800,
     "charge_limit": 2500,
+    "soc_pass": 95,
+    "pass_marge": 30,
+    "pv_max": 4000,
 }
 
 CTRL_MIN_STEP = 10         # W; kleinere Aenderungen werden nicht geschrieben
@@ -159,7 +166,7 @@ LOG_DPS = int(os.getenv("LOG_DPS", "0"))
 DP_NAMES = {
     "102": "SoC", "117": "Modus", "118": "Rueckflussverhinderung",
     "120": "Anti-Rueckstrom", "121": "Einspeisegrenze", "122": "Batterieladegrenze",
-    "123": "SoC max", "124": "SoC min", "125": "PV-Ertrag", "127": "Batt-Spannung",
+    "123": "SoC max", "124": "SoC min", "125": "PV-Ertrag heute", "126": "PV-Ertrag gesamt", "127": "Batt-Spannung",
     "128": "Batt-Leistung", "134": "Status", "137": "Netzleistung",
     "138": "Netzfrequenz", "139": "Netzspannung", "143": "PV gesamt",
     "147": "PV1-P", "148": "PV1-U", "150": "PV1-I", "151": "PV3-P",
@@ -167,7 +174,7 @@ DP_NAMES = {
     "178": "PV2-U", "179": "PV2-I", "180": "PV4-P", "181": "PV4-U",
     "182": "PV4-I", "183": "PV3-U",
     "130": "Zelle max", "131": "Zelle min", "132": "Temperatur 1",
-    "133": "Temperatur 2", "140": "Netzstatus", "141": "Off-Grid-Last",
+    "133": "Temperatur 2", "140": "Off-Grid-Strom", "141": "Off-Grid-Last",
     "142": "Off-Grid-Last (2)", "135": "Off-Grid-Spannung", "119": "Off-Grid-Steckdose",
 }
 
@@ -232,7 +239,8 @@ SENSORS = [
     ("128", "batt_power",    "Batterieleistung",    "W",   "power",       "measurement", 1),
     ("137", "grid_power",    "Netzleistung",        "W",   "power",       "measurement", 1),
     ("143", "pv_power",      "PV-Leistung",         "W",   "power",       "measurement", 1),
-    ("125", "pv_energy",     "PV-Ertrag",           "Wh",  "energy", "total_increasing", 1),
+    ("125", "pv_energy",     "PV-Ertrag heute",     "Wh",  "energy", "total_increasing", 1),
+    ("126", "pv_energy_all", "PV-Ertrag gesamt",    "Wh",  "energy", "total_increasing", 1),
     ("127", "batt_voltage",  "Batteriespannung",    "V",   "voltage",     "measurement", 0.01),
     ("139", "grid_voltage",  "Netzspannung",        "V",   "voltage",     "measurement", 0.1),
     ("138", "grid_freq",     "Netzfrequenz",        "Hz",  "frequency",   "measurement", 0.01),
@@ -257,7 +265,7 @@ SENSORS = [
     ("131", "cell_min",      "Zellspannung min",    "mV",  "voltage",     "measurement", 1),
     ("132", "temp1",         "Temperatur 1",        "°C",  "temperature", "measurement", 0.1),
     ("133", "temp2",         "Temperatur 2",        "°C",  "temperature", "measurement", 0.1),
-    ("140", "grid_state",    "Netzstatus",          None,  None,          None,          None),
+    ("140", "offgrid_curr",  "Off-Grid-Strom",      "A",   "current",     "measurement", 0.1),
     ("156", "pv_limit",      "PV-Ladegrenze",       "W",   "power",       "measurement", 1),
     # Off-Grid-Steckdose: laeuft separat und ist im AC-Ausgang (155) NICHT
     # enthalten. DP 142 zeigt denselben Wert.
@@ -290,6 +298,8 @@ class State:
         self.tune = dict(TUNE_DEFAULTS)
         self.restored = set()      # welche Werte kamen schon aus MQTT zurueck
         self.idle_logged = False   # Leerlauf-Sperre bereits gemeldet?
+        self.pass_on = False       # Durchleitung freigegeben?
+        self.pass_aktiv = False    # Durchleitung laeuft gerade?
         self.soll = 0.0            # interner Sollwert: >0 einspeisen, <0 laden
         self.events = []           # Ereignisliste fuer das Dashboard
         self.last_status = None    # letzter Geraetestatus (fuer Ereignisse)
@@ -560,6 +570,30 @@ def publish_discovery(client):
             "device": DEVICE_INFO,
         }), retain=True)
 
+    # Durchleitung: bei vollem Akku PV-Ueberschuss ins Netz statt
+    # Nulleinspeisung
+    client.publish(f"{DISC}/switch/ep2500/passthrough/config", json.dumps({
+        "name": "Durchleitung bei vollem Akku",
+        "unique_id": "ep2500_passthrough",
+        "state_topic": f"{BASE}/passthrough/state",
+        "command_topic": f"{BASE}/passthrough/set",
+        "payload_on": "ON", "payload_off": "OFF",
+        "icon": "mdi:transmission-tower-export",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    client.publish(f"{DISC}/binary_sensor/ep2500/pass_active/config", json.dumps({
+        "name": "Durchleitung laeuft",
+        "unique_id": "ep2500_pass_active",
+        "state_topic": f"{BASE}/state",
+        "value_template": "{{ 'ON' if value_json.passthrough else 'OFF' }}",
+        "payload_on": "ON", "payload_off": "OFF",
+        "entity_category": "diagnostic",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
     client.publish(f"{DISC}/sensor/ep2500/runtime/config", json.dumps({
         "name": "Restlaufzeit",
         "unique_id": "ep2500_runtime",
@@ -618,6 +652,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     publish_discovery(client)
     for t in (f"{BASE}/limit/set", f"{BASE}/control/set", f"{BASE}/charge/set",
               f"{BASE}/backflow/set", f"{BASE}/correction/set",
+              f"{BASE}/passthrough/set",
               f"{BASE}/socmax/set", f"{BASE}/socmin/set",
               f"{BASE}/shelly_ip/set", f"{BASE}/shelly/set",
               f"{BASE}/shelly2_ip/set", f"{BASE}/shelly2/set",
@@ -631,6 +666,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{BASE}/correction/state")
     client.subscribe(f"{BASE}/control/state")
     client.subscribe(f"{BASE}/events")
+    client.subscribe(f"{BASE}/passthrough/state")
     client.subscribe(f"{BASE}/shelly_ip")
 
     threading.Timer(3.0, publish_settings).start()
@@ -643,6 +679,9 @@ def publish_settings():
                       "ON" if st.control_on else "OFF", retain=True)
     if "shelly_ip" not in st.restored:
         mqttc.publish(f"{BASE}/shelly_ip", st.shelly_ip, retain=True)
+    if "passthrough" not in st.restored:
+        mqttc.publish(f"{BASE}/passthrough/state",
+                      "ON" if st.pass_on else "OFF", retain=True)
     if "correction" not in st.restored:
         mqttc.publish(f"{BASE}/correction/state", st.correction, retain=True)
     for key, val in st.tune.items():
@@ -735,6 +774,22 @@ def on_message(client, userdata, msg):
                             log.error("%s setzen fehlgeschlagen: %s", name, exc)
                 publish_state()
             return
+
+    if topic == f"{BASE}/passthrough/state":
+        if "passthrough" not in st.restored:
+            st.pass_on = payload.upper() == "ON"
+            st.restored.add("passthrough")
+            log.info("Durchleitung %s (gespeichert)",
+                     "freigegeben" if st.pass_on else "gesperrt")
+        return
+
+    if topic == f"{BASE}/passthrough/set":
+        st.pass_on = payload.upper() == "ON"
+        st.restored.add("passthrough")
+        client.publish(f"{BASE}/passthrough/state",
+                       "ON" if st.pass_on else "OFF", retain=True)
+        event("Durchleitung " + ("freigegeben" if st.pass_on else "gesperrt"))
+        return
 
     if topic == f"{BASE}/backflow/set":
         sperren = payload.upper() == "ON"
@@ -875,7 +930,8 @@ def write_dp(dp, watt, vmax, reason=""):
     st.last_write = time.time()
     st.merge({dp: watt})
     log.info("%s -> %s W (%s)%s",
-             "Einspeisegrenze" if dp == DP_LIMIT else "Ladegrenze",
+             {DP_LIMIT: "Einspeisegrenze", DP_CHARGE: "Batterieladegrenze",
+              DP_PV_LIMIT: "PV-Grenze"}.get(dp, f"DP {dp}"),
              watt, reason, "" if isinstance(res, dict) else f" {res}")
     return True
 
@@ -903,6 +959,7 @@ def publish_state():
     if DP_CHARGE in dps:
         out["charge"] = dps[DP_CHARGE]
     out["soll"] = int(round(st.soll))
+    out["passthrough"] = st.pass_aktiv
     if DP_OFFGRID in dps:
         out["offgrid"] = bool(dps[DP_OFFGRID])
     if DP_BACKFLOW in dps:
@@ -1191,6 +1248,16 @@ def charge_guard_loop():
             set_charge(soll, reason="Freigabe PV-Ladung")
 
 
+def set_pv_limit(watt, reason=""):
+    """Schreibt DP 156, die PV-Ladeleistung.
+
+    Damit laesst sich die Solarseite drosseln, ohne die Einspeisung
+    anzutasten. Achtung: Das Geraet fuehrt diesen Wert auch selbst nach,
+    wenn in der App ein PV-Zeitplan hinterlegt ist.
+    """
+    return write_dp(DP_PV_LIMIT, watt, 4000, reason)
+
+
 def set_backflow(sperren, quelle=""):
     """Schaltet die Rueckflussverhinderung (DP 118).
 
@@ -1262,6 +1329,85 @@ def control_loop():
         if st.idle_logged:
             event("Regelung wieder aktiv - Geraet reagiert")
             st.idle_logged = False
+
+        # Durchleitung: Ist der Akku voll, wird nicht mehr auf den Zaehler
+        # geregelt, sondern die Einspeisegrenze der PV-Leistung nachgefuehrt.
+        # Das Geraet gibt dann genau das ab, was die Sonne liefert - der Akku
+        # bleibt unangetastet, und der Ueberschuss steht anderen Speichern am
+        # Netz zur Verfuegung. Ein fester Sollwert wuerde den Akku leeren,
+        # sobald die PV darunter faellt.
+        soc = dps.get("102")
+        pv = dps.get("143")
+        schwelle = st.tune["soc_pass"]
+        if st.pass_on and isinstance(soc, (int, float)):
+            # Hysterese: einmal aktiv, bleibt es bis 5 % unter der Schwelle
+            grenze = schwelle - 5 if st.pass_aktiv else schwelle
+            aktiv = soc >= grenze
+        else:
+            aktiv = False
+
+        if aktiv != st.pass_aktiv:
+            st.pass_aktiv = aktiv
+            event("Durchleitung " + ("aktiv - Bilanz wird auf null geregelt"
+                                     if aktiv else "beendet - zurueck auf Nulleinspeisung"))
+            if not aktiv:
+                # PV-Grenze wieder ganz oeffnen, sonst bleibt die Ernte
+                # gedrosselt
+                set_pv_limit(st.tune["pv_max"], reason="Durchleitung beendet")
+
+        if aktiv:
+            # Bilanzregelung: Ziel ist eine Batterieleistung von null. Dann
+            # geht genau die PV-Leistung ins Netz, ohne dass der Akku
+            # geladen oder entladen wird.
+            #
+            # Zwei Stellglieder mit klarer Rangfolge:
+            #   Akku wird entladen -> zu viel Einspeisung. Einspeisegrenze
+            #     zuruecknehmen und die PV-Grenze wieder ganz oeffnen, damit
+            #     die Ernte nach einer Wolke sofort zurueckkommt.
+            #   Akku wird geladen  -> zu wenig Einspeisung. Erst die
+            #     Einspeisung erhoehen; ist die am Anschlag, die PV drosseln.
+            #
+            # So bleibt der Ladestand stehen und das Geraet erreicht den
+            # Lade-Stopp nicht - dort wuerde es die MPPTs abschalten.
+            batt = dps.get(DP_BATT)
+            pv_grenze = dps.get(DP_PV_LIMIT)
+            if not isinstance(batt, (int, float)):
+                continue
+
+            toleranz = max(20, st.tune["deadband"])
+            pv_offen = st.tune["pv_max"]
+
+            if batt < -toleranz:
+                # Akku liefert zu - Einspeisung ist zu hoch
+                if isinstance(pv_grenze, int) and pv_grenze < pv_offen:
+                    set_pv_limit(pv_offen, reason="Durchleitung: PV freigeben")
+                neu_export = max(0, min(LIMIT_MAX, limit + int(batt)))
+                if abs(neu_export - limit) >= CTRL_MIN_STEP:
+                    log.info("Durchleitung | Akku %+d W | PV %s W | SoC %s %% | "
+                             "Einspeisen %s -> %s", batt, pv, soc, limit, neu_export)
+                    set_limit(neu_export, reason="Durchleitung")
+                    publish_state()
+
+            elif batt > toleranz:
+                # Akku laedt - es koennte mehr ins Netz gehen
+                if limit < LIMIT_MAX:
+                    neu_export = min(LIMIT_MAX, limit + int(batt))
+                    if abs(neu_export - limit) >= CTRL_MIN_STEP:
+                        log.info("Durchleitung | Akku %+d W | PV %s W | SoC %s %% | "
+                                 "Einspeisen %s -> %s", batt, pv, soc, limit, neu_export)
+                        set_limit(neu_export, reason="Durchleitung")
+                        publish_state()
+                elif isinstance(pv, (int, float)) and isinstance(pv_grenze, int):
+                    # Einspeisung am Anschlag - PV drosseln, damit der Akku
+                    # nicht weiter volllaeuft
+                    neu_pv = max(0, min(pv_offen, int(pv) - int(batt)))
+                    if abs(neu_pv - pv_grenze) >= CTRL_MIN_STEP:
+                        log.info("Durchleitung | Akku %+d W | Einspeisung am "
+                                 "Anschlag | PV-Grenze %s -> %s",
+                                 batt, pv_grenze, neu_pv)
+                        set_pv_limit(neu_pv, reason="Durchleitung: drosseln")
+                        publish_state()
+            continue
 
         if abs(fehler) <= st.tune["deadband"]:
             continue

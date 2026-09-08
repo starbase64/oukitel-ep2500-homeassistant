@@ -12,14 +12,19 @@ Regulation holds the grid connection at ±4 W.
 
 ## What you get
 
-- 30+ sensors: SoC, all four MPPT strings individually, cell voltages,
-  temperatures, power values, off-grid load
-- Feed-in limit and battery charge limit continuously adjustable
+- 35+ sensors: SoC, all four MPPT strings individually, cell voltages,
+  temperatures, power values, off-grid load, voltage and current
+- Feed-in limit, battery charge limit, PV charge limit and SoC thresholds
+  continuously adjustable
 - Zero-export controller with anti-windup and idle detection
+- **Pass-through mode**: once the battery is full, the controller balances
+  export and PV so the state of charge holds steady and the surplus goes to
+  the grid instead of being thrown away
+- Estimated remaining runtime
 - Controller parameters adjustable from the dashboard, no restart needed
 - Event log covering the last 48 hours
 - Plausibility filter for the firmware's 16-bit overflow values
-- Optional Shelly integration for an independent cross-check
+- Optional Shelly integration for independent cross-checks
 
 ## Documentation
 
@@ -58,7 +63,13 @@ value open automatically; if you use your own integration, do the same.
 **DP 118 ("backflow prevention") blocks export, not grid charging.** Enabling
 it stops the device from feeding in and sends it to standby.
 
-Both cost me days of troubleshooting. Details in the
+**There is no direct PV-to-grid path.** The device only runs its MPPT
+controllers while it can charge the battery. Once the charge-stop SoC is
+reached it shuts the solar side down, discharges to serve the export, and
+restarts the PV about five percent lower. The pass-through mode in this bridge
+works around that by holding the state of charge steady below the charge stop.
+
+All three cost me days of troubleshooting. Details in the
 [datapoint reference](docs/datapoints.md).
 
 ## Caveats
