@@ -39,7 +39,7 @@ You need the device ID, local key and IP address of your EP2500. See the
 [setup guide](docs/setup.md) for how to obtain them.
 
 ```bash
-git clone https://github.com/YOUR_NAME/oukitel-ep2500-homeassistant.git
+git clone https://github.com/starbase64/oukitel-ep2500-homeassistant.git
 cd oukitel-ep2500-homeassistant
 cp docker-compose.example.yml docker-compose.yml
 # edit docker-compose.yml with your values

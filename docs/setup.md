@@ -169,7 +169,7 @@ and runs the control loop. The script is `ep2500_bridge.py` in the repository ro
 ## 5.1 Create the directory
 
 ```bash
-git clone https://github.com/YOUR_NAME/oukitel-ep2500-homeassistant.git
+git clone https://github.com/starbase64/oukitel-ep2500-homeassistant.git
 cd oukitel-ep2500-homeassistant
 cp docker-compose.example.yml docker-compose.yml
 ```

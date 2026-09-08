@@ -79,9 +79,6 @@ BATT_WH = int(os.getenv("BATT_WH", "2048"))
 # Zweiter Shelly, z. B. am Nord-Balkonkraftwerk. Leer lassen, wenn
 # nicht vorhanden.
 
-# Nutzbare Kapazitaet fuer die Laufzeitschaetzung. Laut Typenschild
-# 51,2 V x 40 Ah = 2048 Wh.
-BATT_WH = int(os.getenv("BATT_WH", "2048"))
 ECO_ABSURD = 30000          # W; alles darueber ist keine Messung mehr
 
 GRID_TOPIC = os.getenv("GRID_TOPIC", "ecotracker/power")
@@ -198,6 +195,16 @@ DP_NOISY = {"102", "125", "126", "127", "128", "135", "136", "137", "138",
             "164", "178", "179", "180", "181", "182", "183"}
 
 
+def ist_standby(status):
+    """Erkennt den Standby-Zustand aus DP 134.
+
+    Die Firmware schreibt "standy_status" (ohne b). Andere Versionen koennten
+    "standby" oder aehnliches liefern, deshalb wird nur auf den Wortstamm
+    geprueft.
+    """
+    return "stand" in str(status).lower()
+
+
 def log_changes(changed, quelle=""):
     if not LOG_DPS or not changed:
         return
@@ -232,8 +239,8 @@ def event(text, auch_loggen=True):
             "anzahl": len(liste),
             "eintraege": liste,
         }), retain=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Ereignis konnte nicht veroeffentlicht werden: %s", exc)
 
 logging.basicConfig(
     level=os.getenv("LOGLEVEL", "INFO"),
@@ -329,6 +336,15 @@ class State:
         self.shelly2_power = None
         self.shelly2_on = None
         self.shelly2_fails = 0
+
+    def tune_get(self, key):
+        """Liest einen Regelparameter unter Sperre."""
+        with self.lock:
+            return self.tune[key]
+
+    def tune_set(self, key, wert):
+        with self.lock:
+            self.tune[key] = wert
 
     def merge(self, dps):
         """Uebernimmt Werte in den Cache und liefert die Aenderungen zurueck.
@@ -850,7 +866,7 @@ def on_message(client, userdata, msg):
             # Auch den gespeicherten Sollwert mitziehen, sonst setzt der
             # Waechter die Grenze binnen 30 s wieder zurueck.
             val = max(0, min(CHARGE_HW_MAX, int(val)))
-            st.tune["charge_limit"] = val
+            st.tune_set("charge_limit", val)
             mqttc.publish(f"{BASE}/tune/charge_limit", val, retain=True)
             set_charge(val, reason="manuell")
         return
@@ -876,6 +892,9 @@ def on_message(client, userdata, msg):
         with st.lock:
             st.grid = float(val)
             st.grid_ts = time.time()
+        # Auch bei MQTT-Quelle den Wert veroeffentlichen, sonst bleibt der
+        # Sensor "Zaehlerleistung (Regler)" in HA leer.
+        client.publish(f"{BASE}/grid", int(val))
         return
 
     if topic == f"{BASE}/limit/set":
@@ -910,7 +929,7 @@ def apply_tune(key, payload, source="", echo=True):
     if val is None:
         return False
     val = typ(max(vmin, min(vmax, val)))
-    st.tune[key] = val
+    st.tune_set(key, val)
     if echo:
         mqttc.publish(f"{BASE}/tune/{key}", val, retain=True)
     log.info("%s = %s%s (%s)", name, val, f" {unit}" if unit else "", source)
@@ -1210,7 +1229,7 @@ def shelly_status(ip):
 def shelly_schalten_roh(ip, an):
     """Schaltet einen Shelly. Gen2/Gen3 zuerst, dann Gen1."""
     try:
-        shelly_schalten_roh(ip, an)
+        shelly_rpc(ip, f"Switch.Set?id=0&on={'true' if an else 'false'}")
         return
     except Exception:
         pass
@@ -1396,7 +1415,7 @@ def control_loop():
         # und trotzdem nichts kommt (leerer Akku). Steht die Grenze auf 0,
         # weil der Regler sie selbst dorthin gesetzt hat, darf nicht
         # pausiert werden - sonst faehrt er nie wieder an.
-        leerlauf = (status == "standy_status" and ist == 0.0 and limit >= 20
+        leerlauf = (ist_standby(status) and ist == 0.0 and limit >= 20
                     and fehler > 0)
         if leerlauf:
             if not st.idle_logged:
@@ -1521,7 +1540,9 @@ def main():
                   ", ".join(fehlend))
         raise SystemExit(1)
 
-    mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    # connect_async blockiert nicht: die Bridge startet auch dann, wenn der
+    # Broker noch nicht erreichbar ist, und verbindet sich spaeter selbst.
+    mqttc.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
     mqttc.loop_start()
 
     threading.Thread(target=tuya_loop, daemon=True).start()
