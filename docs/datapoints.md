@@ -68,6 +68,7 @@ even with an empty battery and full sun. See the section on quirks below.
 | 137 | Grid power (mirrors 155) | W | likely |
 | 138 | Grid frequency | ÷100 → Hz | certain |
 | 139 | Grid voltage | ÷10 → V | certain |
+| 136 | Grid current | ÷10 → 0.8 A | certain |
 | 141 / 142 | Off-grid socket load, both registers identical | W | certain |
 | 140 | Off-grid output current | ÷10 → 8.7 A | certain |
 | 143 | Total PV power | W | certain |
@@ -127,7 +128,6 @@ been able to complete the pairing yet.
 | 111 | constant 0 | – |
 | 116 | constant 0 | – |
 | 129 | counter; once ran from 0 to 13 in 20 s, then reset to 0 | grid sync timer? |
-| 136 | varies (7 … 35), no correlation found | – |
 
 | 144 | constant 0 | – |
 | 149 | alternates between 0 and 2, often together with 101 and 114 | – |

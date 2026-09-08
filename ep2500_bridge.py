@@ -181,6 +181,7 @@ DP_NAMES = {
     "184": "SW Wechselrichter PV", "115": "Zaehler-Seriennummer",
     "145": "OTA-URL", "152": "WLAN-Name (Zaehler)",
     "153": "WLAN-Passwort (Zaehler)", "154": "Netzwerkschalter",
+    "136": "Netzstrom",
     "142": "Off-Grid-Last (2)", "135": "Off-Grid-Spannung", "119": "Off-Grid-Steckdose",
 }
 
@@ -250,6 +251,7 @@ SENSORS = [
     ("127", "batt_voltage",  "Batteriespannung",    "V",   "voltage",     "measurement", 0.01),
     ("139", "grid_voltage",  "Netzspannung",        "V",   "voltage",     "measurement", 0.1),
     ("138", "grid_freq",     "Netzfrequenz",        "Hz",  "frequency",   "measurement", 0.01),
+    ("136", "grid_current",  "Netzstrom",           "A",   "current",     "measurement", 0.1),
     ("134", "status",        "Status",              None,  None,          None,          None),
     ("117", "mode",          "Betriebsmodus",       None,  None,          None,          None),
     # Vier MPPT-Strings. Leistung, Spannung und Strom liegen im Geraet

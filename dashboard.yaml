@@ -207,6 +207,8 @@ views:
           - type: divider
           - entity: sensor.oukitel_ep2500_netzspannung
             name: Netzspannung
+          - entity: sensor.oukitel_ep2500_netzstrom
+            name: Netzstrom
           - entity: sensor.oukitel_ep2500_netzfrequenz
             name: Netzfrequenz
       - type: history-graph
