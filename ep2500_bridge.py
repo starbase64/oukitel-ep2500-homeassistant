@@ -1545,7 +1545,8 @@ def control_loop():
             # jeder Wolke weiter nach unten treiben.
             schritt = max(-PASS_STEP_FAST,
                           min(PASS_STEP_FAST, -abweichung * PASS_STEP))
-            wartezeit = PASS_ADJUST_FAST if abweichung >= PASS_ALARM else PASS_ADJUST
+            wartezeit = (PASS_ADJUST_FAST if abs(abweichung) >= PASS_ALARM
+                         else PASS_ADJUST)
             st.pass_next = time.time() + wartezeit
 
             # Anti-Windup: Nach oben nur nachfuehren, wenn die Grenze
