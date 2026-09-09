@@ -2,259 +2,238 @@ views:
   - title: EP2500
     path: ep2500
     icon: mdi:home-battery
-    type: sections
-    max_columns: 3
-    dense_section_placement: false
-    sections:
-      - type: grid
-        column_span: 1
+    cards:
+      - type: vertical-stack
         cards:
-          - type: heading
-            heading: Messwerte
-            heading_style: title
-            icon: mdi:gauge
-          - type: vertical-stack
-            cards:
-              - type: gauge
-                entity: sensor.oukitel_ep2500_ladestand
-                name: Ladestand
-                unit: '%'
-                min: 0
-                max: 100
-                severity:
-                  green: 50
-                  yellow: 20
-                  red: 0
-              - type: markdown
-                content: >-
-                  {% set r = states('sensor.oukitel_ep2500_restlaufzeit') %}
-
-                  {% if r not in ['unknown', 'unavailable', 'none', ''] %} {%
-                  set h = r | float %} <center>Reicht noch <b>{{ h | int }} h {{
-                  ((h - (h | int)) * 60) | round(0) | int }} min</b> bei
-                  aktueller Last</center> {% elif
-                  states('sensor.oukitel_ep2500_batterieleistung') | float(0) >
-                  5 %} <center>Akku lädt</center> {% else %} <center>Kein
-                  Entladebetrieb</center> {% endif %}
-              - type: glance
-                title: Aktuell
-                columns: 6
-                state_color: false
-                entities:
-                  - entity: sensor.oukitel_ep2500_pv_leistung
-                    name: PV
-                  - entity: sensor.oukitel_ep2500_ac_ausgangsleistung
-                    name: Einspeisung
-                  - entity: sensor.oukitel_ep2500_batterieleistung
-                    name: Akku
-                  - entity: sensor.oukitel_ep2500_zaehlerleistung_regler
-                    name: Zähler
-                  - entity: sensor.oukitel_ep2500_shelly_leistung
-                    name: Shelly
-                  - entity: sensor.oukitel_ep2500_nord_bkw_leistung
-                    name: Nord-BKW
-          - type: entities
-            title: Leistungen
-            show_header_toggle: false
-            entities:
-              - entity: sensor.oukitel_ep2500_pv_leistung
-                name: PV gesamt
-              - entity: sensor.oukitel_ep2500_ep2500_pv_ertrag_heute
-                name: PV-Ertrag heute
-              - entity: sensor.oukitel_ep2500_pv_ertrag_gesamt
-                name: PV-Ertrag gesamt
-              - entity: sensor.oukitel_ep2500_pv_ladegrenze
-                name: PV-Ladegrenze
-              - entity: sensor.oukitel_ep2500_ac_ausgangsleistung
-                name: AC-Ausgang
-              - entity: sensor.oukitel_ep2500_netzleistung
-                name: Netzleistung
-              - entity: sensor.oukitel_ep2500_off_grid_last
-                name: Off-Grid-Last
-              - entity: sensor.oukitel_ep2500_off_grid_spannung
-                name: Off-Grid-Spannung
-              - entity: sensor.oukitel_ep2500_off_grid_strom
-                name: Off-Grid-Strom
-          - type: entities
-            title: PV-Strings
-            show_header_toggle: false
-            entities:
-              - entity: sensor.oukitel_ep2500_pv1_leistung
-                name: PV1
-              - entity: sensor.oukitel_ep2500_pv1_spannung
-                name: '  PV1 Spannung'
-              - entity: sensor.oukitel_ep2500_pv1_strom
-                name: '  PV1 Strom'
-              - type: divider
-              - entity: sensor.oukitel_ep2500_pv2_leistung
-                name: PV2
-              - entity: sensor.oukitel_ep2500_pv2_spannung
-                name: '  PV2 Spannung'
-              - entity: sensor.oukitel_ep2500_pv2_strom
-                name: '  PV2 Strom'
-              - type: divider
-              - entity: sensor.oukitel_ep2500_pv3_leistung
-                name: PV3
-              - entity: sensor.oukitel_ep2500_pv3_spannung
-                name: '  PV3 Spannung'
-              - entity: sensor.oukitel_ep2500_pv3_strom
-                name: '  PV3 Strom'
-              - type: divider
-              - entity: sensor.oukitel_ep2500_pv4_leistung
-                name: PV4
-              - entity: sensor.oukitel_ep2500_pv4_spannung
-                name: '  PV4 Spannung'
-              - entity: sensor.oukitel_ep2500_pv4_strom
-                name: '  PV4 Strom'
-          - type: entities
-            title: Batterie & Netz
-            show_header_toggle: false
-            entities:
-              - entity: sensor.oukitel_ep2500_batteriespannung
-                name: Batteriespannung
-              - entity: sensor.oukitel_ep2500_zellspannung_max
-                name: Zellspannung max
-              - entity: sensor.oukitel_ep2500_zellspannung_min
-                name: Zellspannung min
-              - entity: sensor.oukitel_ep2500_temperatur_1
-                name: Temperatur 1
-              - entity: sensor.oukitel_ep2500_temperatur_2
-                name: Temperatur 2
-              - type: divider
-              - entity: sensor.oukitel_ep2500_netzspannung
-                name: Netzspannung
-              - entity: sensor.oukitel_ep2500_netzstrom
-                name: Netzstrom
-              - entity: sensor.oukitel_ep2500_netzfrequenz
-                name: Netzfrequenz
-      - type: grid
-        column_span: 1
-        cards:
-          - type: heading
-            heading: Steuerung & Einstellungen
-            heading_style: title
-            icon: mdi:tune-vertical
-          - type: entities
-            title: Schalter & Grenzen
-            show_header_toggle: false
-            entities:
-              - entity: switch.oukitel_ep2500_nulleinspeisung_regelung
-                name: Regelung aktiv
-              - entity: switch.oukitel_ep2500_durchleitung_bei_vollem_akku
-                name: Durchleitung bei vollem Akku
-              - entity: binary_sensor.oukitel_ep2500_durchleitung_laeuft
-                name: Durchleitung läuft gerade
-              - entity: switch.oukitel_ep2500_rueckflussverhinderung
-                name: Rückflussverhinderung (sperrt Einspeisung)
-              - entity: switch.oukitel_ep2500_off_grid_steckdose
-                name: Off-Grid-Steckdose
-              - entity: switch.oukitel_ep2500_shelly_netztrennung
-                name: Shelly (Netztrennung)
-              - entity: text.oukitel_ep2500_shelly_ip
-                name: Shelly IP
-              - entity: switch.oukitel_ep2500_nord_bkw
-                name: Nord-BKW
-              - entity: text.oukitel_ep2500_nord_bkw_shelly_ip
-                name: Nord-BKW Shelly IP
-              - type: divider
-              - entity: number.oukitel_ep2500_einspeisegrenze
-                name: Einspeisegrenze
-              - entity: number.oukitel_ep2500_batterieladegrenze
-                name: Batterieladegrenze (PV + Netz)
-              - entity: number.oukitel_ep2500_korrekturwert
-                name: Zielwert am Zähler
-              - type: divider
-              - entity: number.oukitel_ep2500_lade_stopp
-                name: Lade-Stopp (SoC max)
-              - entity: number.oukitel_ep2500_entlade_stopp
-                name: Entlade-Stopp (SoC min)
-              - type: divider
-              - entity: sensor.oukitel_ep2500_regler_sollwert
-                name: Regler-Sollwert
-              - entity: sensor.oukitel_ep2500_status
-                name: Betriebszustand
-              - entity: sensor.oukitel_ep2500_betriebsmodus
-                name: Modus
-          - type: entities
-            title: Feineinstellung Regler
-            show_header_toggle: false
-            entities:
-              - entity: number.oukitel_ep2500_regelintervall
-                name: Intervall
-              - entity: number.oukitel_ep2500_reglerverstaerkung
-                name: Verstärkung
-              - entity: number.oukitel_ep2500_totband
-                name: Totband
-              - entity: number.oukitel_ep2500_max_schrittweite
-                name: Max. Schritt
-              - entity: number.oukitel_ep2500_durchleitung_ab_soc
-                name: Durchleitung ab SoC
-              - entity: number.oukitel_ep2500_durchleitung_reserve
-                name: Durchleitung Reserve
-              - entity: number.oukitel_ep2500_pv_grenze_offen
-                name: PV-Grenze offen
-          - type: history-graph
-            title: Regelverhalten (letzte 3 h)
-            hours_to_show: 3
-            refresh_interval: 10
-            entities:
-              - entity: sensor.oukitel_ep2500_zaehlerleistung_regler
-                name: Zähler
-              - entity: sensor.oukitel_ep2500_regler_sollwert
-                name: Sollwert
-              - entity: sensor.oukitel_ep2500_ac_ausgangsleistung
-                name: Ist
-      - type: grid
-        column_span: 1
-        cards:
-          - type: heading
-            heading: Verlauf & Ereignisse
-            heading_style: title
-            icon: mdi:chart-line
+          - type: gauge
+            entity: sensor.oukitel_ep2500_ladestand
+            name: Ladestand
+            unit: "%"
+            min: 0
+            max: 100
+            severity:
+              green: 50
+              yellow: 20
+              red: 0
           - type: markdown
-            title: Ereignisse (48 h)
-            card_mod:
-              style: |
-                ha-card {
-                  max-height: 420px;
-                  overflow-y: auto;
-                }
             content: >-
-              {% set liste = state_attr('sensor.oukitel_ep2500_ereignisse',
-              'eintraege') %}
+              {% set r = states('sensor.oukitel_ep2500_restlaufzeit') %}
 
-              {% if liste %} {% for e in liste | reverse | list %} **{{ e.t }}**
-              · {{ e.m }}
-
-              {% endfor %} {% else %} _Noch keine Ereignisse aufgezeichnet._ {%
-              endif %}
-          - type: history-graph
-            title: Akku & PV (24 h)
-            hours_to_show: 24
+              {% if r not in ['unknown', 'unavailable', 'none', ''] %}
+              {% set h = r | float %}
+              <center>Reicht noch <b>{{ h | int }} h {{ ((h - (h | int)) * 60) |
+              round(0) | int }} min</b> bei aktueller Last</center>
+              {% elif states('sensor.oukitel_ep2500_batterieleistung') | float(0) > 5 %}
+              <center>Akku lädt</center>
+              {% else %}
+              <center>Kein Entladebetrieb</center>
+              {% endif %}
+          - type: glance
+            title: Aktuell
+            columns: 6
+            state_color: false
             entities:
-              - entity: sensor.oukitel_ep2500_ladestand
-                name: SoC
               - entity: sensor.oukitel_ep2500_pv_leistung
                 name: PV
+              - entity: sensor.oukitel_ep2500_ac_ausgangsleistung
+                name: Einspeisung
               - entity: sensor.oukitel_ep2500_batterieleistung
                 name: Akku
-          - type: history-graph
-            title: PV-Strings im Verlauf (12 h)
-            hours_to_show: 12
-            entities:
-              - entity: sensor.oukitel_ep2500_pv1_leistung
-                name: PV1
-              - entity: sensor.oukitel_ep2500_pv2_leistung
-                name: PV2
-              - entity: sensor.oukitel_ep2500_pv3_leistung
-                name: PV3
-              - entity: sensor.oukitel_ep2500_pv4_leistung
-                name: PV4
-          - type: history-graph
-            title: Zellspannungen (24 h)
-            hours_to_show: 24
-            entities:
-              - entity: sensor.oukitel_ep2500_zellspannung_max
-                name: max
-              - entity: sensor.oukitel_ep2500_zellspannung_min
-                name: min
+              - entity: sensor.oukitel_ep2500_zaehlerleistung_regler
+                name: Zähler
+              - entity: sensor.oukitel_ep2500_shelly_leistung
+                name: Shelly
+              - entity: sensor.oukitel_ep2500_nord_bkw_leistung
+                name: Nord-BKW
+      - type: entities
+        title: Steuerung
+        show_header_toggle: false
+        entities:
+          - entity: switch.oukitel_ep2500_nulleinspeisung_regelung
+            name: Regelung aktiv
+          - entity: switch.oukitel_ep2500_durchleitung_bei_vollem_akku
+            name: Durchleitung bei vollem Akku
+          - entity: binary_sensor.oukitel_ep2500_durchleitung_laeuft
+            name: Durchleitung läuft gerade
+          - entity: switch.oukitel_ep2500_rueckflussverhinderung
+            name: Rückflussverhinderung (sperrt Einspeisung)
+          - entity: switch.oukitel_ep2500_off_grid_steckdose
+            name: Off-Grid-Steckdose
+          - entity: switch.oukitel_ep2500_shelly_netztrennung
+            name: Shelly (Netztrennung)
+          - entity: text.oukitel_ep2500_shelly_ip
+            name: Shelly IP
+          - entity: switch.oukitel_ep2500_nord_bkw
+            name: Nord-BKW
+          - entity: text.oukitel_ep2500_nord_bkw_shelly_ip
+            name: Nord-BKW Shelly IP
+          - type: divider
+          - entity: number.oukitel_ep2500_einspeisegrenze
+            name: Einspeisegrenze
+          - entity: number.oukitel_ep2500_batterieladegrenze
+            name: Batterieladegrenze (PV + Netz)
+          - entity: number.oukitel_ep2500_korrekturwert
+            name: Zielwert am Zähler
+          - type: divider
+          - entity: number.oukitel_ep2500_lade_stopp
+            name: Lade-Stopp (SoC max)
+          - entity: number.oukitel_ep2500_entlade_stopp
+            name: Entlade-Stopp (SoC min)
+          - type: divider
+          - entity: sensor.oukitel_ep2500_regler_sollwert
+            name: Regler-Sollwert
+          - entity: sensor.oukitel_ep2500_status
+            name: Betriebszustand
+          - entity: sensor.oukitel_ep2500_betriebsmodus
+            name: Modus
+
+      - type: history-graph
+        title: Regelverhalten (letzte 3 h)
+        hours_to_show: 3
+        refresh_interval: 10
+        entities:
+          - entity: sensor.oukitel_ep2500_zaehlerleistung_regler
+            name: Zähler
+          - entity: sensor.oukitel_ep2500_regler_sollwert
+            name: Sollwert
+          - entity: sensor.oukitel_ep2500_ac_ausgangsleistung
+            name: Ist
+      - type: history-graph
+        title: Akku & PV (24 h)
+        hours_to_show: 24
+        entities:
+          - entity: sensor.oukitel_ep2500_ladestand
+            name: SoC
+          - entity: sensor.oukitel_ep2500_pv_leistung
+            name: PV
+          - entity: sensor.oukitel_ep2500_batterieleistung
+            name: Akku
+      - type: markdown
+        title: Ereignisse (48 h)
+        card_mod:
+          style: |
+            ha-card {
+              max-height: 400px;
+              overflow-y: auto;
+            }
+        content: >-
+          {% set liste = state_attr('sensor.oukitel_ep2500_ereignisse',
+          'eintraege') %}
+
+          {% if liste %} {% for e in liste | reverse | list %} **{{ e.t }}** ·
+          {{ e.m }}
+
+          {% endfor %} {% else %} _Noch keine Ereignisse aufgezeichnet._ {%
+          endif %}
+      - type: entities
+        title: Leistungen
+        show_header_toggle: false
+        entities:
+          - entity: sensor.oukitel_ep2500_pv_leistung
+            name: PV gesamt
+          - entity: sensor.oukitel_ep2500_pv_ertrag_heute
+            name: PV-Ertrag heute
+          - entity: sensor.oukitel_ep2500_pv_ertrag_gesamt
+            name: PV-Ertrag gesamt
+          - entity: sensor.oukitel_ep2500_pv_grenze
+            name: PV-Ladegrenze
+          - entity: sensor.oukitel_ep2500_ac_ausgangsleistung
+            name: AC-Ausgang
+          - entity: sensor.oukitel_ep2500_netzleistung
+            name: Netzleistung
+          - entity: sensor.oukitel_ep2500_off_grid_last
+            name: Off-Grid-Last
+          - entity: sensor.oukitel_ep2500_off_grid_spannung
+            name: Off-Grid-Spannung
+          - entity: sensor.oukitel_ep2500_off_grid_strom
+            name: Off-Grid-Strom
+      - type: entities
+        title: PV-Strings
+        show_header_toggle: false
+        entities:
+          - entity: sensor.oukitel_ep2500_pv1_leistung
+            name: PV1
+          - entity: sensor.oukitel_ep2500_pv1_spannung
+            name: "  PV1 Spannung"
+          - entity: sensor.oukitel_ep2500_pv1_strom
+            name: "  PV1 Strom"
+          - type: divider
+          - entity: sensor.oukitel_ep2500_pv2_leistung
+            name: PV2
+          - entity: sensor.oukitel_ep2500_pv2_spannung
+            name: "  PV2 Spannung"
+          - entity: sensor.oukitel_ep2500_pv2_strom
+            name: "  PV2 Strom"
+          - type: divider
+          - entity: sensor.oukitel_ep2500_pv3_leistung
+            name: PV3
+          - entity: sensor.oukitel_ep2500_pv3_spannung
+            name: "  PV3 Spannung"
+          - entity: sensor.oukitel_ep2500_pv3_strom
+            name: "  PV3 Strom"
+          - type: divider
+          - entity: sensor.oukitel_ep2500_pv4_leistung
+            name: PV4
+          - entity: sensor.oukitel_ep2500_pv4_spannung
+            name: "  PV4 Spannung"
+          - entity: sensor.oukitel_ep2500_pv4_strom
+            name: "  PV4 Strom"
+      - type: history-graph
+        title: PV-Strings im Verlauf (12 h)
+        hours_to_show: 12
+        entities:
+          - entity: sensor.oukitel_ep2500_pv1_leistung
+            name: PV1
+          - entity: sensor.oukitel_ep2500_pv2_leistung
+            name: PV2
+          - entity: sensor.oukitel_ep2500_pv3_leistung
+            name: PV3
+          - entity: sensor.oukitel_ep2500_pv4_leistung
+            name: PV4
+      - type: entities
+        title: Batterie & Netz
+        show_header_toggle: false
+        entities:
+          - entity: sensor.oukitel_ep2500_batteriespannung
+            name: Batteriespannung
+          - entity: sensor.oukitel_ep2500_zellspannung_max
+            name: Zellspannung max
+          - entity: sensor.oukitel_ep2500_zellspannung_min
+            name: Zellspannung min
+          - entity: sensor.oukitel_ep2500_temperatur_1
+            name: Temperatur 1
+          - entity: sensor.oukitel_ep2500_temperatur_2
+            name: Temperatur 2
+          - type: divider
+          - entity: sensor.oukitel_ep2500_netzspannung
+            name: Netzspannung
+          - entity: sensor.oukitel_ep2500_netzstrom
+            name: Netzstrom
+          - entity: sensor.oukitel_ep2500_netzfrequenz
+            name: Netzfrequenz
+      - type: history-graph
+        title: Zellspannungen (24 h)
+        hours_to_show: 24
+        entities:
+          - entity: sensor.oukitel_ep2500_zellspannung_max
+            name: max
+          - entity: sensor.oukitel_ep2500_zellspannung_min
+            name: min
+      - type: entities
+        title: Feineinstellung Regler
+        show_header_toggle: false
+        entities:
+          - entity: number.oukitel_ep2500_regelintervall
+            name: Intervall
+          - entity: number.oukitel_ep2500_reglerverstaerkung
+            name: Verstärkung
+          - entity: number.oukitel_ep2500_totband
+            name: Totband
+          - entity: number.oukitel_ep2500_max_schrittweite
+            name: Max. Schritt
+          - entity: number.oukitel_ep2500_durchleitung_ab_soc
+            name: Durchleitung ab SoC
+          - entity: number.oukitel_ep2500_durchleitung_reserve
+            name: Durchleitung Reserve
+          - entity: number.oukitel_ep2500_pv_grenze_offen
+            name: PV-Grenze offen
