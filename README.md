@@ -17,9 +17,10 @@ Regulation holds the grid connection at ±4 W.
 - Feed-in limit, battery charge limit, PV charge limit and SoC thresholds
   continuously adjustable
 - Zero-export controller with anti-windup and idle detection
-- **Pass-through mode**: once the battery is full, the controller balances
-  export and PV so the state of charge holds steady and the surplus goes to
-  the grid instead of being thrown away
+- **Pass-through mode**: above a configurable state of charge the controller
+  stops regulating against the meter. It pins the export limit at `LIMIT_MAX`
+  and trims the PV charge power so the state of charge holds steady, keeping
+  the device away from the charge stop where it would shut the solar side down
 - Estimated remaining runtime
 - Controller parameters adjustable from the dashboard, no restart needed
 - Event log covering the last 48 hours

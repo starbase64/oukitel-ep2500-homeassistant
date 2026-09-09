@@ -119,7 +119,6 @@ TUNABLES = {
     "max_step": ("Max. Schrittweite", 10,  800, 10,  "W", int),
     "charge_limit": ("Batterieladegrenze", 0, CHARGE_HW_MAX, 100, "W", int),
     "soc_pass":  ("Durchleitung ab SoC", 50, 100, 1, "%", int),
-    "pass_marge": ("Durchleitung Reserve", 0, 300, 10, "W", int),
     "pv_max":    ("PV-Grenze offen", 500, 4000, 100, "W", int),
 }
 
@@ -130,12 +129,28 @@ TUNE_DEFAULTS = {
     "max_step": 800,
     "charge_limit": 2500,
     "soc_pass": 95,
-    "pass_marge": 30,
     "pv_max": 4000,
 }
 
 CTRL_MIN_STEP = 10         # W; kleinere Aenderungen werden nicht geschrieben
 WINDUP_MARGIN = 60         # W; wie weit der Sollwert vom Istwert abweichen darf
+
+# Durchleitung: Der EP2500 hat keinen direkten Pfad von PV zum Netz - die
+# Einspeisung kommt immer aus dem Akku, und PV geht immer in den Akku. Ein
+# stehender Ladestand heisst also: PV-Ladeleistung gleich Einspeiseleistung.
+# Beide Werte werden deshalb fest gesetzt und nur noch traege nachgefuehrt.
+#
+# Geregelt wird auf den Ladestand, nicht auf die Batterieleistung. Der
+# Ladestand ist genau die Groesse, die gehalten werden soll, und er ist
+# traege. Die Batterieleistung trifft mit 20 bis 70 s Verzoegerung ein - als
+# Regelgroesse fuehrt sie zu Schwingungen mit vollem Ausschlag.
+PASS_HYST = 5              # %-Punkte unter dem Ziel endet die Durchleitung
+PASS_STEP = 25             # W je normalem Nachfuehrschritt
+PASS_STEP_FAST = 150       # W je Schritt im Alarmbereich
+PASS_ADJUST = 180          # s zwischen zwei Nachfuehrschritten
+PASS_ADJUST_FAST = 45      # s im Alarmbereich
+PASS_ALARM = 3             # %-Punkte ueber Ziel = Alarmbereich
+PASS_SETTLE = 120          # s Ruhe nach dem Start, bevor nachgefuehrt wird
 
 # Das Geraet liefert einzelne Werte als vorzeichenlose 16-Bit-Zahl. 65535
 # ist dann keine Leistung, sondern -1. Ab dieser Schwelle wird zurueck-
@@ -323,6 +338,8 @@ class State:
         self.idle_logged = False   # Leerlauf-Sperre bereits gemeldet?
         self.pass_on = False       # Durchleitung freigegeben?
         self.pass_aktiv = False    # Durchleitung laeuft gerade?
+        self.pass_pv_soll = 0      # W; nachgefuehrte PV-Ladeleistung
+        self.pass_next = 0.0       # Zeitpunkt des naechsten Nachfuehrschritts
         self.grid_fail = False     # Zaehlerausfall bereits behandelt?
         self.soll = 0.0            # interner Sollwert: >0 einspeisen, <0 laden
         self.events = []           # Ereignisliste fuer das Dashboard
@@ -674,7 +691,8 @@ def publish_discovery(client):
 
     # Abgeloeste Entitaeten entfernen (leere Payload loescht sie in HA)
     for pfad in ("switch/ep2500/gridcharge", "number/ep2500/tune_charge_max",
-                 "number/ep2500/tune_hyst", "sensor/ep2500/pv_strings"):
+                 "number/ep2500/tune_hyst", "sensor/ep2500/pv_strings",
+                 "number/ep2500/tune_pass_marge"):
         client.publish(f"{DISC}/{pfad}/config", "", retain=True)
 
     log.info("Discovery veroeffentlicht")
@@ -1394,6 +1412,10 @@ def control_loop():
     PV laedt automatisch den Akku. Ein Stellglied fuer die Ladeleistung
     braucht es dafuer nicht - DP 122 bleibt dauerhaft offen, siehe
     charge_guard_loop().
+
+    Oberhalb von "Durchleitung ab SoC" uebernimmt ein zweiter, voellig
+    anderer Zweig: dort wird nicht mehr auf den Zaehler geregelt, sondern der
+    Ladestand gehalten und konstant eingespeist. Siehe die Kommentare dort.
     """
     while True:
         time.sleep(st.tune["interval"])
@@ -1407,6 +1429,17 @@ def control_loop():
             target = st.correction
 
         if grid is None or grid_age > GRID_MAX_AGE:
+            if st.pass_aktiv:
+                # Die Durchleitung regelt auf den Ladestand, nicht auf den
+                # Zaehler - sie laeuft ohne Zaehlerwert unveraendert weiter.
+                # Sie hier abzubrechen wuerde die PV-Grenze ganz oeffnen und
+                # den Akku bei voller Sonne in die Abschaltung bei 100 %
+                # treiben. Genau davor soll die Durchleitung schuetzen.
+                if not st.grid_fail:
+                    st.grid_fail = True
+                    event("Zaehler liefert keine Werte - Durchleitung laeuft "
+                          "unveraendert weiter")
+                continue
             if not st.grid_fail:
                 st.grid_fail = True
                 event(f"Zaehler liefert keine Werte - Einspeisegrenze auf "
@@ -1414,9 +1447,6 @@ def control_loop():
                 # Ohne Zaehlerwert kann nicht geregelt werden. Die zuletzt
                 # gesetzte Grenze einfach stehen zu lassen hiesse, blind
                 # weiterzuspeisen.
-                if st.pass_aktiv:
-                    set_pv_limit(st.tune["pv_max"], reason="Zaehlerausfall")
-                    st.pass_aktiv = False
                 set_limit(GRID_FAIL_LIMIT, reason="Zaehlerausfall")
                 st.soll = float(GRID_FAIL_LIMIT)
                 publish_state()
@@ -1451,86 +1481,92 @@ def control_loop():
             event("Regelung wieder aktiv - Geraet reagiert")
             st.idle_logged = False
 
-        # Durchleitung: Ist der Akku voll, wird nicht mehr auf den Zaehler
-        # geregelt, sondern die Einspeisegrenze der PV-Leistung nachgefuehrt.
-        # Das Geraet gibt dann genau das ab, was die Sonne liefert - der Akku
-        # bleibt unangetastet, und der Ueberschuss steht anderen Speichern am
-        # Netz zur Verfuegung. Ein fester Sollwert wuerde den Akku leeren,
-        # sobald die PV darunter faellt.
+        # ------------------------------------------------------------------
+        # Durchleitung
+        # ------------------------------------------------------------------
+        # Ziel: Der Ladestand bleibt stehen und das Geraet speist konstant
+        # LIMIT_MAX ins Hausnetz. Weil PV beim EP2500 immer ueber den Akku
+        # laeuft, heisst das schlicht: PV-Ladeleistung so einstellen, dass
+        # sie die Einspeisung deckt. Zwei feste Werte, keine Bilanzregelung.
+        #
+        # Nachgefuehrt wird nur der Wandlungsverlust, und zwar am Ladestand.
+        # Der Verlust wirkt in die sichere Richtung: 800 W in den Akku ergeben
+        # am Ausgang weniger als 800 W, der Ladestand sinkt also von selbst
+        # leicht ab. Ueberschreitungen sind damit die Ausnahme, nicht die
+        # Regel - deshalb genuegt ein kleiner Schritt alle paar Minuten.
         soc = dps.get("102")
-        pv = dps.get("143")
-        schwelle = st.tune["soc_pass"]
+        ziel = st.tune["soc_pass"]
         if st.pass_on and isinstance(soc, (int, float)):
-            # Hysterese: einmal aktiv, bleibt es bis 5 % unter der Schwelle
-            grenze = schwelle - 5 if st.pass_aktiv else schwelle
+            # Hysterese: einmal aktiv, bleibt es bis PASS_HYST unter dem Ziel
+            grenze = ziel - PASS_HYST if st.pass_aktiv else ziel
             aktiv = soc >= grenze
         else:
             aktiv = False
 
         if aktiv != st.pass_aktiv:
             st.pass_aktiv = aktiv
-            event("Durchleitung " + ("aktiv - Bilanz wird auf null geregelt"
-                                     if aktiv else "beendet - zurueck auf Nulleinspeisung"))
-            if not aktiv:
+            if aktiv:
+                st.pass_pv_soll = LIMIT_MAX
+                st.pass_next = time.time() + PASS_SETTLE
+                event(f"Durchleitung aktiv - halte Ladestand bei {ziel} %, "
+                      f"{LIMIT_MAX} W ins Hausnetz")
+                set_limit(LIMIT_MAX, reason="Durchleitung")
+                set_pv_limit(st.pass_pv_soll, reason="Durchleitung")
+                st.soll = float(LIMIT_MAX)
+            else:
+                event("Durchleitung beendet - zurueck auf Nulleinspeisung")
                 # PV-Grenze wieder ganz oeffnen, sonst bleibt die Ernte
                 # gedrosselt
                 set_pv_limit(st.tune["pv_max"], reason="Durchleitung beendet")
+            publish_state()
 
         if aktiv:
-            # Bilanzregelung: Ziel ist eine Batterieleistung von null. Dann
-            # geht genau die PV-Leistung ins Netz, ohne dass der Akku
-            # geladen oder entladen wird.
-            #
-            # Zwei Stellglieder mit klarer Rangfolge:
-            #   Akku wird entladen -> zu viel Einspeisung. Einspeisegrenze
-            #     zuruecknehmen und die PV-Grenze wieder ganz oeffnen, damit
-            #     die Ernte nach einer Wolke sofort zurueckkommt.
-            #   Akku wird geladen  -> zu wenig Einspeisung. Erst die
-            #     Einspeisung erhoehen; ist die am Anschlag, die PV drosseln.
-            #
-            # So bleibt der Ladestand stehen und das Geraet erreicht den
-            # Lade-Stopp nicht - dort wuerde es die MPPTs abschalten.
-            batt = dps.get(DP_BATT)
-            pv_grenze = dps.get(DP_PV_LIMIT)
-            if not isinstance(batt, (int, float)):
+            # Die Einspeisegrenze steht fest. Falls sie jemand anders
+            # verstellt hat (App, abgelehntes Kommando), zurueckholen.
+            if isinstance(limit, int) and limit != LIMIT_MAX:
+                log.info("Durchleitung | Einspeisegrenze steht auf %s W "
+                         "statt %s W - korrigiert", limit, LIMIT_MAX)
+                set_limit(LIMIT_MAX, reason="Durchleitung: Grenze halten")
+                st.soll = float(LIMIT_MAX)
+                publish_state()
+
+            if time.time() < st.pass_next:
                 continue
 
-            # Die Reserve wirkt als Totband um die Nullbilanz: kleine
-            # Abweichungen werden ignoriert, damit nicht bei jedem Wolkenzug
-            # nachgeregelt wird.
-            toleranz = max(st.tune["pass_marge"], st.tune["deadband"])
-            pv_offen = st.tune["pv_max"]
+            abweichung = int(soc) - ziel
+            if abweichung == 0:
+                # Ladestand sitzt auf dem Ziel - nichts tun.
+                st.pass_next = time.time() + PASS_ADJUST
+                continue
 
-            if batt < -toleranz:
-                # Akku liefert zu - Einspeisung ist zu hoch
-                if isinstance(pv_grenze, int) and pv_grenze < pv_offen:
-                    set_pv_limit(pv_offen, reason="Durchleitung: PV freigeben")
-                neu_export = max(0, min(LIMIT_MAX, limit + int(batt)))
-                if abs(neu_export - limit) >= CTRL_MIN_STEP:
-                    log.info("Durchleitung | Akku %+d W | PV %s W | SoC %s %% | "
-                             "Einspeisen %s -> %s", batt, pv, soc, limit, neu_export)
-                    set_limit(neu_export, reason="Durchleitung")
-                    publish_state()
+            # Schrittweite proportional zur Abweichung. Wichtig ist die
+            # Symmetrie: runter und rauf gleich schnell. Ein schnelles
+            # Absenken mit langsamem Zurueckholen wuerde den Ladestand bei
+            # jeder Wolke weiter nach unten treiben.
+            schritt = max(-PASS_STEP_FAST,
+                          min(PASS_STEP_FAST, -abweichung * PASS_STEP))
+            wartezeit = PASS_ADJUST_FAST if abweichung >= PASS_ALARM else PASS_ADJUST
+            st.pass_next = time.time() + wartezeit
 
-            elif batt > toleranz:
-                # Akku laedt - es koennte mehr ins Netz gehen
-                if limit < LIMIT_MAX:
-                    neu_export = min(LIMIT_MAX, limit + int(batt))
-                    if abs(neu_export - limit) >= CTRL_MIN_STEP:
-                        log.info("Durchleitung | Akku %+d W | PV %s W | SoC %s %% | "
-                                 "Einspeisen %s -> %s", batt, pv, soc, limit, neu_export)
-                        set_limit(neu_export, reason="Durchleitung")
-                        publish_state()
-                elif isinstance(pv, (int, float)) and isinstance(pv_grenze, int):
-                    # Einspeisung am Anschlag - PV drosseln, damit der Akku
-                    # nicht weiter volllaeuft
-                    neu_pv = max(0, min(pv_offen, int(pv) - int(batt)))
-                    if abs(neu_pv - pv_grenze) >= CTRL_MIN_STEP:
-                        log.info("Durchleitung | Akku %+d W | Einspeisung am "
-                                 "Anschlag | PV-Grenze %s -> %s",
-                                 batt, pv_grenze, neu_pv)
-                        set_pv_limit(neu_pv, reason="Durchleitung: drosseln")
-                        publish_state()
+            # Anti-Windup: Nach oben nur nachfuehren, wenn die Grenze
+            # ueberhaupt wirkt. Liefert die PV weniger als erlaubt, ist die
+            # Wolke die Ursache und nicht die Einstellung - den Sollwert dann
+            # weiter hochzudrehen aendert nichts, und bei der naechsten
+            # Aufklarung schiesst der Ladestand ueber.
+            pv_ist = dps.get("143")
+            if (schritt > 0 and isinstance(pv_ist, (int, float))
+                    and pv_ist < st.pass_pv_soll - PASS_STEP):
+                continue
+
+            neu = max(0, min(st.tune["pv_max"], st.pass_pv_soll + schritt))
+            if neu == st.pass_pv_soll:
+                continue
+            st.pass_pv_soll = neu
+            log.info("Durchleitung | SoC %s %% (Ziel %s) | Akku %s W | "
+                     "PV-Ladeleistung -> %s W",
+                     soc, ziel, dps.get(DP_BATT, "?"), neu)
+            set_pv_limit(neu, reason="Durchleitung: Ladestand halten")
+            publish_state()
             continue
 
         if abs(fehler) <= st.tune["deadband"]:
