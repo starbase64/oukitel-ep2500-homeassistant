@@ -97,7 +97,7 @@ DP_PV_LIMIT = "156"        # PV-Ladeleistung, schreibbar
 
 LIMIT_MIN = 0
 LIMIT_MAX = int(os.getenv("LIMIT_MAX", "800"))   # gesetzliche Obergrenze
-LIMIT_SAFE = int(os.getenv("LIMIT_SAFE", "300")) # Fallback beim Beenden
+LIMIT_SAFE = int(os.getenv("LIMIT_SAFE", "0"))   # Fallback beim Beenden
 # Einspeisegrenze, auf die zurueckgefallen wird, wenn der Zaehler laenger
 # als GRID_MAX_AGE keine Werte liefert. 0 stoppt die Einspeisung ganz,
 # ein positiver Wert speist blind weiter. Die Batterieladegrenze bleibt
@@ -371,6 +371,7 @@ class State:
         self.pass_aktiv = False    # Durchleitung laeuft gerade?
         self.pass_pv_soll = 0      # W; nachgefuehrte PV-Ladeleistung
         self.pass_next = 0.0       # Zeitpunkt des naechsten Nachfuehrschritts
+        self.pv_reopen = False     # PV-Grenze nach Durchleitung noch zu oeffnen?
         self.grid_fail = False     # Zaehlerausfall bereits behandelt?
         self.soll = 0.0            # interner Sollwert: >0 einspeisen, <0 laden
         self.events = []           # Ereignisliste fuer das Dashboard
@@ -707,7 +708,7 @@ def publish_discovery(client):
         "name": "Stoerung",
         "unique_id": "ep2500_fault_active",
         "state_topic": f"{BASE}/state",
-        "value_template": "{{ 'ON' if value_json.fault else 'OFF' }}",
+        "value_template": "{{ 'ON' if value_json.fault_active else 'OFF' }}",
         "payload_on": "ON", "payload_off": "OFF",
         "device_class": "problem",
         "entity_category": "diagnostic",
@@ -1122,8 +1123,13 @@ def publish_state():
     out["soll"] = int(round(st.soll))
     out["passthrough"] = st.pass_aktiv
     fehler = dps.get("149")
+    fehler_text, fehler_ernst = fehler_klartext(fehler)
     out["fault"] = fehler if isinstance(fehler, int) else 0
-    out["fault_text"] = fehler_klartext(fehler)[0]
+    out["fault_text"] = fehler_text
+    # Eigener Wahrheitswert: Der Rohwert 2 ist ungleich null, aber harmlos.
+    # Ein Binaersensor auf den Rohwert wuerde dabei Alarm schlagen, waehrend
+    # der Text daneben "kein Fehler" anzeigt.
+    out["fault_active"] = fehler_ernst
     if DP_OFFGRID in dps:
         out["offgrid"] = bool(dps[DP_OFFGRID])
     if DP_BACKFLOW in dps:
@@ -1527,63 +1533,10 @@ def control_loop():
         if not st.control_on or not st.online:
             continue
 
-        with st.lock:
-            grid = st.grid
-            grid_age = time.time() - st.grid_ts
-            target = st.correction
-
-        if grid is None or grid_age > GRID_MAX_AGE:
-            if st.pass_aktiv:
-                # Die Durchleitung regelt auf den Ladestand, nicht auf den
-                # Zaehler - sie laeuft ohne Zaehlerwert unveraendert weiter.
-                # Sie hier abzubrechen wuerde die PV-Grenze ganz oeffnen und
-                # den Akku bei voller Sonne in die Abschaltung bei 100 %
-                # treiben. Genau davor soll die Durchleitung schuetzen.
-                if not st.grid_fail:
-                    st.grid_fail = True
-                    event("Zaehler liefert keine Werte - Durchleitung laeuft "
-                          "unveraendert weiter")
-                continue
-            if not st.grid_fail:
-                st.grid_fail = True
-                event(f"Zaehler liefert keine Werte - Einspeisegrenze auf "
-                      f"{GRID_FAIL_LIMIT} W")
-                # Ohne Zaehlerwert kann nicht geregelt werden. Die zuletzt
-                # gesetzte Grenze einfach stehen zu lassen hiesse, blind
-                # weiterzuspeisen.
-                set_limit(GRID_FAIL_LIMIT, reason="Zaehlerausfall")
-                st.soll = float(GRID_FAIL_LIMIT)
-                publish_state()
-            continue
-        if st.grid_fail:
-            st.grid_fail = False
-            event("Zaehler liefert wieder Werte - Regelung aktiv")
-
         dps = st.snapshot()
         limit = dps.get(DP_LIMIT)
-        ac_out = dps.get(DP_AC_OUT)
-        status = dps.get("134")
         if limit is None:
             continue
-
-        ist = float(ac_out) if isinstance(ac_out, (int, float)) else 0.0
-        fehler = grid - target          # >0 = Netzbezug, Geraet muss mehr abgeben
-
-        # Leerlauf-Sperre: Nur wenn tatsaechlich Leistung angefordert wurde
-        # und trotzdem nichts kommt (leerer Akku). Steht die Grenze auf 0,
-        # weil der Regler sie selbst dorthin gesetzt hat, darf nicht
-        # pausiert werden - sonst faehrt er nie wieder an.
-        leerlauf = (ist_standby(status) and ist == 0.0 and limit >= 20
-                    and fehler > 0)
-        if leerlauf:
-            if not st.idle_logged:
-                event("Regelung pausiert - Geraet im Standby, "
-                      f"Akku {dps.get('102', '?')} %")
-                st.idle_logged = True
-            continue
-        if st.idle_logged:
-            event("Regelung wieder aktiv - Geraet reagiert")
-            st.idle_logged = False
 
         # ------------------------------------------------------------------
         # Durchleitung
@@ -1610,19 +1563,36 @@ def control_loop():
         if aktiv != st.pass_aktiv:
             st.pass_aktiv = aktiv
             if aktiv:
-                st.pass_pv_soll = LIMIT_MAX
                 st.pass_next = time.time() + PASS_SETTLE
                 event(f"Durchleitung aktiv - halte Ladestand bei {ziel} %, "
                       f"{LIMIT_MAX} W ins Hausnetz")
                 set_limit(LIMIT_MAX, reason="Durchleitung")
-                set_pv_limit(st.pass_pv_soll, reason="Durchleitung")
                 st.soll = float(LIMIT_MAX)
+                # Auch hier gilt: den Merker nur bei erfolgreichem Schreiben
+                # fortschreiben. Wird der Befehl abgelehnt, stuende sonst
+                # gleich zu Beginn ein Wert im Regler, den das Geraet nie
+                # bekommen hat.
+                if set_pv_limit(LIMIT_MAX, reason="Durchleitung"):
+                    st.pass_pv_soll = LIMIT_MAX
+                else:
+                    st.pass_next = time.time() + PASS_ADJUST_FAST
             else:
                 event("Durchleitung beendet - zurueck auf Nulleinspeisung")
                 # PV-Grenze wieder ganz oeffnen, sonst bleibt die Ernte
-                # gedrosselt
-                set_pv_limit(st.tune["pv_max"], reason="Durchleitung beendet")
+                # gedrosselt. Schlaegt das fehl, muss es wiederholt werden -
+                # sonst bleibt die Solarseite dauerhaft abgeregelt, ohne dass
+                # es jemand merkt. Genau das ist am 09.09. um 14:32 passiert.
+                if not set_pv_limit(st.tune["pv_max"],
+                                    reason="Durchleitung beendet"):
+                    st.pv_reopen = True
             publish_state()
+
+        # Nachholen, falls das Oeffnen der PV-Grenze beim Beenden fehlschlug.
+        if st.pv_reopen and not aktiv:
+            if set_pv_limit(st.tune["pv_max"],
+                            reason="Durchleitung beendet (Wiederholung)"):
+                st.pv_reopen = False
+                publish_state()
 
         if aktiv:
             # Die Einspeisegrenze steht fest. Falls sie jemand anders
@@ -1699,6 +1669,51 @@ def control_loop():
                 # laeuft von der Wirklichkeit weg. Bald nochmal versuchen.
                 st.pass_next = time.time() + PASS_ADJUST_FAST
             continue
+
+        # Ab hier nur noch die Nulleinspeisung. Sie braucht den Zaehler, die
+        # Durchleitung oben nicht - deshalb steht sie vor dieser Pruefung.
+        with st.lock:
+            grid = st.grid
+            grid_age = time.time() - st.grid_ts
+            target = st.correction
+
+        if grid is None or grid_age > GRID_MAX_AGE:
+            if not st.grid_fail:
+                st.grid_fail = True
+                event(f"Zaehler liefert keine Werte - Einspeisegrenze auf "
+                      f"{GRID_FAIL_LIMIT} W")
+                # Ohne Zaehlerwert kann nicht geregelt werden. Die zuletzt
+                # gesetzte Grenze einfach stehen zu lassen hiesse, blind
+                # weiterzuspeisen.
+                set_limit(GRID_FAIL_LIMIT, reason="Zaehlerausfall")
+                st.soll = float(GRID_FAIL_LIMIT)
+                publish_state()
+            continue
+        if st.grid_fail:
+            st.grid_fail = False
+            event("Zaehler liefert wieder Werte - Regelung aktiv")
+
+        ac_out = dps.get(DP_AC_OUT)
+        status = dps.get("134")
+
+        ist = float(ac_out) if isinstance(ac_out, (int, float)) else 0.0
+        fehler = grid - target          # >0 = Netzbezug, Geraet muss mehr abgeben
+
+        # Leerlauf-Sperre: Nur wenn tatsaechlich Leistung angefordert wurde
+        # und trotzdem nichts kommt (leerer Akku). Steht die Grenze auf 0,
+        # weil der Regler sie selbst dorthin gesetzt hat, darf nicht
+        # pausiert werden - sonst faehrt er nie wieder an.
+        leerlauf = (ist_standby(status) and ist == 0.0 and limit >= 20
+                    and fehler > 0)
+        if leerlauf:
+            if not st.idle_logged:
+                event("Regelung pausiert - Geraet im Standby, "
+                      f"Akku {dps.get('102', '?')} %")
+                st.idle_logged = True
+            continue
+        if st.idle_logged:
+            event("Regelung wieder aktiv - Geraet reagiert")
+            st.idle_logged = False
 
         if abs(fehler) <= st.tune["deadband"]:
             continue
