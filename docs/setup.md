@@ -214,6 +214,34 @@ services:
 Mind the indentation – in YAML it defines the structure. Check with
 `docker compose config` that the file parses.
 
+## Pass-through: how it holds the state of charge
+
+Because there is no direct PV-to-grid path, a steady state of charge simply
+means PV charge power equals export power. Pass-through therefore sets two
+fixed values rather than running a balance controller: the export limit goes
+to `LIMIT_MAX` and stays there, and DP 156 (PV charge power) starts at the
+same figure.
+
+Only the conversion loss is trimmed away, and it is trimmed against the state
+of charge, not against battery power. The state of charge is the quantity you
+want to hold, it moves slowly, and it arrives on time. Battery power (DP 128)
+lags by 20 to 70 seconds; using it as the control variable makes the loop
+oscillate between full charge and full discharge.
+
+The trim is one small step every few minutes, proportional to how far the
+state of charge sits from the target and symmetric in both directions. It is
+skipped upward when the PV limit is not the binding constraint — under cloud
+the panels deliver less than the limit allows, and raising it further would
+only cause an overshoot when the sun returns.
+
+Set the target with `Durchleitung ab SoC`. Pass-through engages at that value
+and then holds it, dropping back to zero-export control five points below.
+
+While pass-through is active the harvest is capped at `LIMIT_MAX`. That is
+unavoidable on this device: the alternative is letting the battery reach the
+charge stop, where it shuts the MPPTs down and restarts about five percent
+lower.
+
 **On the meter source:** `GRID_SOURCE: "http"` polls a meter directly over
 HTTP. It expects a JSON field holding the power, positive when importing,
 negative when exporting. For a different source set it to `mqtt` and push the
