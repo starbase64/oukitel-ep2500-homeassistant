@@ -151,6 +151,8 @@ PASS_ADJUST = 180          # s zwischen zwei Nachfuehrschritten
 PASS_ADJUST_FAST = 45      # s im Alarmbereich
 PASS_ALARM = 3             # %-Punkte ueber Ziel = Alarmbereich
 PASS_SETTLE = 120          # s Ruhe nach dem Start, bevor nachgefuehrt wird
+PASS_BATT_BIAS = 50        # W je %-Punkt Abweichung, Zielwert fuers Gate
+PASS_PV_CAP = 2 * LIMIT_MAX  # W; hoeher braucht die Durchleitung nie
 
 # Das Geraet liefert einzelne Werte als vorzeichenlose 16-Bit-Zahl. 65535
 # ist dann keine Leistung, sondern -1. Ab dieser Schwelle wird zurueck-
@@ -200,7 +202,7 @@ DP_NAMES = {
     "184": "SW Wechselrichter PV", "115": "Zaehler-Seriennummer",
     "145": "OTA-URL", "152": "WLAN-Name (Zaehler)",
     "153": "WLAN-Passwort (Zaehler)", "154": "Netzwerkschalter",
-    "136": "Netzstrom",
+    "136": "Netzstrom", "149": "Systemfehler",
     "142": "Off-Grid-Last (2)", "135": "Off-Grid-Spannung", "119": "Off-Grid-Steckdose",
 }
 
@@ -220,8 +222,36 @@ def ist_standby(status):
     return "stand" in str(status).lower()
 
 
+def fehler_melden(wert):
+    """Meldet eine Aenderung am Systemfehlerregister (DP 149) als Ereignis.
+
+    Das harmlose Flackern zwischen 0 und 2 loest nichts aus, und beim Start
+    der Bridge wird nicht rueckwirkend eine Entwarnung gemeldet.
+    """
+    vorher = st.fehler_gemeldet
+    if wert == vorher:
+        return
+    st.fehler_gemeldet = wert
+    text, ernst = fehler_klartext(wert)
+    if ernst:
+        event(f"Systemfehler {wert}: {text} - bleibt gespeichert, bis das "
+              f"Geraet neu gestartet wird")
+    elif vorher is not None and fehler_klartext(vorher)[1]:
+        event("Systemfehler zurueckgesetzt")
+
+
 def log_changes(changed, quelle=""):
-    if not LOG_DPS or not changed:
+    """Protokolliert geaenderte Datenpunkte und prueft das Fehlerregister.
+
+    Die Fehlerpruefung steht absichtlich vor der LOG_DPS-Schranke. Sie ist
+    keine Protokollierung, sondern eine Ueberwachung, und muss deshalb auch
+    dann laufen, wenn das DP-Log abgeschaltet ist.
+    """
+    if not changed:
+        return
+    if "149" in changed:
+        fehler_melden(changed["149"][1])
+    if not LOG_DPS:
         return
     for dp, (alt, neu) in sorted(changed.items(), key=lambda x: int(x[0])):
         if LOG_DPS == 1 and dp in DP_NOISY:
@@ -336,6 +366,7 @@ class State:
         self.tune = dict(TUNE_DEFAULTS)
         self.restored = set()      # welche Werte kamen schon aus MQTT zurueck
         self.idle_logged = False   # Leerlauf-Sperre bereits gemeldet?
+        self.fehler_gemeldet = None  # zuletzt als Ereignis gemeldeter DP 149
         self.pass_on = False       # Durchleitung freigegeben?
         self.pass_aktiv = False    # Durchleitung laeuft gerade?
         self.pass_pv_soll = 0      # W; nachgefuehrte PV-Ladeleistung
@@ -652,6 +683,34 @@ def publish_discovery(client):
         "unit_of_measurement": "h",
         "device_class": "duration",
         "icon": "mdi:battery-clock",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    # Systemfehler (DP 149). Der Wert bleibt nach einer Stoerung gespeichert
+    # und verschwindet erst durch einen Neustart des Geraets - ohne Anzeige
+    # laeuft die Anlage sonst tagelang mit einer Meldung, die niemand sieht.
+    client.publish(f"{DISC}/sensor/ep2500/fault/config", json.dumps({
+        "name": "Systemfehler",
+        "unique_id": "ep2500_fault",
+        "state_topic": f"{BASE}/state",
+        "value_template": "{{ value_json.fault_text }}",
+        "json_attributes_topic": f"{BASE}/state",
+        "json_attributes_template": "{{ {'rohwert': value_json.fault} | tojson }}",
+        "icon": "mdi:alert-circle-outline",
+        "entity_category": "diagnostic",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    client.publish(f"{DISC}/binary_sensor/ep2500/fault_active/config", json.dumps({
+        "name": "Stoerung",
+        "unique_id": "ep2500_fault_active",
+        "state_topic": f"{BASE}/state",
+        "value_template": "{{ 'ON' if value_json.fault else 'OFF' }}",
+        "payload_on": "ON", "payload_off": "OFF",
+        "device_class": "problem",
+        "entity_category": "diagnostic",
         "availability_topic": f"{BASE}/available",
         "device": DEVICE_INFO,
     }), retain=True)
@@ -1062,6 +1121,9 @@ def publish_state():
         out["charge"] = dps[DP_CHARGE]
     out["soll"] = int(round(st.soll))
     out["passthrough"] = st.pass_aktiv
+    fehler = dps.get("149")
+    out["fault"] = fehler if isinstance(fehler, int) else 0
+    out["fault_text"] = fehler_klartext(fehler)[0]
     if DP_OFFGRID in dps:
         out["offgrid"] = bool(dps[DP_OFFGRID])
     if DP_BACKFLOW in dps:
@@ -1404,6 +1466,48 @@ def set_backflow(sperren, quelle=""):
     return True
 
 
+# Bits des Systemfehlerregisters DP 149. Die App zeigt nur die nackte Zahl
+# an und beschriftet sie mit "Systemfehler". Bit 7 ist durch einen Versuch
+# belegt: eine gezielt erzeugte Ueberlast am AC-Ausgang setzte den Wert auf
+# 128, das Geraet warf die Netzseite ab, und der Wert blieb stehen, bis das
+# Geraet neu gestartet wurde.
+#
+# Dass es sich um ein Bitfeld handelt, ist eine begruendete Vermutung und
+# nicht bewiesen: bisher wurden nur 2 und 128 beobachtet, beides Zweier-
+# potenzen. Ein kombinierter Wert wie 130 waere der Beweis. Unbekannte Bits
+# werden deshalb einzeln und ehrlich als solche ausgewiesen.
+# Schluessel ist jeweils der Bitwert, nicht die Bitnummer.
+FEHLER_BITS = {
+    128: "Ueberlast am AC-Ausgang",   # Bit 7
+}
+# Bits, die im ungestoerten Betrieb auftreten und keine Stoerung sind.
+FEHLER_HARMLOS = {2}                  # Bit 1, wechselt zusammen mit 101/114
+
+
+def fehler_klartext(wert):
+    """Zerlegt DP 149 in die gesetzten Bits.
+
+    Rueckgabe: (Text, ernst). ``ernst`` ist False, solange nur als harmlos
+    bekannte Bits gesetzt sind - sonst wuerde das normale Flackern des
+    Registers dauernd Alarm ausloesen.
+    """
+    if not isinstance(wert, int) or wert == 0:
+        return "kein Fehler", False
+    teile, ernst = [], False
+    for bit in range(16):
+        maske = 1 << bit
+        if not wert & maske:
+            continue
+        if maske in FEHLER_HARMLOS:
+            continue
+        ernst = True
+        teile.append(FEHLER_BITS.get(maske,
+                                     f"unbekanntes Bit {bit} ({maske})"))
+    if not teile:
+        return "kein Fehler", False
+    return ", ".join(teile), ernst
+
+
 def control_loop():
     """Regelt die Einspeisung ueber DP 121.
 
@@ -1549,6 +1653,25 @@ def control_loop():
                          else PASS_ADJUST)
             st.pass_next = time.time() + wartezeit
 
+            # Batterie-Gate: nicht weiter verstellen, wenn die Batterie
+            # bereits in die gewuenschte Richtung arbeitet. Der Ladestand
+            # hinkt der Leistung um Minuten hinterher. Ohne diese Bremse
+            # schiebt der Regler waehrend der Nachlaufzeit weiter nach und
+            # schiesst weit ueber das Ziel hinaus - genau so ist der
+            # PV-Sollwert einmal von 725 auf 0 gelaufen, obwohl die Ladung
+            # schon fast stand.
+            #
+            # Die Batterieleistung ist hier nur eine Vorzeichenpruefung, keine
+            # Regelgroesse. Ihre Verzoegerung von 20 bis 70 s faellt bei einem
+            # Takt von 45 s und mehr nicht ins Gewicht.
+            batt = dps.get(DP_BATT)
+            soll_batt = -abweichung * PASS_BATT_BIAS
+            if isinstance(batt, (int, float)):
+                if schritt < 0 and batt <= soll_batt:
+                    continue
+                if schritt > 0 and batt >= soll_batt:
+                    continue
+
             # Anti-Windup: Nach oben nur nachfuehren, wenn die Grenze
             # ueberhaupt wirkt. Liefert die PV weniger als erlaubt, ist die
             # Wolke die Ursache und nicht die Einstellung - den Sollwert dann
@@ -1559,15 +1682,22 @@ def control_loop():
                     and pv_ist < st.pass_pv_soll - PASS_STEP):
                 continue
 
-            neu = max(0, min(st.tune["pv_max"], st.pass_pv_soll + schritt))
+            obergrenze = min(PASS_PV_CAP, st.tune["pv_max"])
+            neu = max(0, min(obergrenze, st.pass_pv_soll + schritt))
             if neu == st.pass_pv_soll:
                 continue
-            st.pass_pv_soll = neu
             log.info("Durchleitung | SoC %s %% (Ziel %s) | Akku %s W | "
-                     "PV-Ladeleistung -> %s W",
-                     soc, ziel, dps.get(DP_BATT, "?"), neu)
-            set_pv_limit(neu, reason="Durchleitung: Ladestand halten")
-            publish_state()
+                     "PV-Ladeleistung %s -> %s W",
+                     soc, ziel, batt, st.pass_pv_soll, neu)
+            if set_pv_limit(neu, reason="Durchleitung: Ladestand halten"):
+                st.pass_pv_soll = neu
+                publish_state()
+            else:
+                # Abgelehnt: Das Geraet hat den Wert nicht uebernommen. Den
+                # Merker stehen lassen, sonst rechnet der Regler ab jetzt von
+                # einem Wert weiter, der nie gesetzt wurde, und seine Annahme
+                # laeuft von der Wirklichkeit weg. Bald nochmal versuchen.
+                st.pass_next = time.time() + PASS_ADJUST_FAST
             continue
 
         if abs(fehler) <= st.tune["deadband"]:
