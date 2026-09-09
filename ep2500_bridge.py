@@ -1703,9 +1703,19 @@ def control_loop():
         if abs(fehler) <= st.tune["deadband"]:
             continue
 
-        # Anti-Windup: Der Sollwert darf sich nicht beliebig weit von dem
-        # entfernen, was das Geraet tatsaechlich schafft.
-        soll = max(ist - WINDUP_MARGIN, min(ist + WINDUP_MARGIN, st.soll))
+        # Anti-Windup: Der Sollwert darf nicht ueber das hinauslaufen, was das
+        # Geraet tatsaechlich schafft. Liefert die PV nur 300 W, waere ein
+        # Sollwert von 800 W eine Zahl ohne Wirkung, die beim naechsten
+        # Aufklaren schlagartig wirksam wuerde.
+        #
+        # Nur nach oben klammern. Eine untere Klammer (soll mindestens
+        # ist - Marge) hat hier lange Schaden angerichtet: DP 155 kommt im
+        # Abstand von etwa 20 s, der Regler laeuft alle paar Sekunden. Direkt
+        # nach einer Absenkung zeigt "ist" noch den alten, hohen Ausgang, und
+        # die untere Klammer hob die gerade vorgenommene Korrektur wieder auf.
+        # Beobachtet: bei -15 W Zaehlerabweichung sprang der Sollwert von 432
+        # auf 720 W, weil "ist" noch auf 795 W stand.
+        soll = min(ist + WINDUP_MARGIN, st.soll)
 
         max_step = st.tune["max_step"]
         soll += max(-max_step, min(max_step, fehler * st.tune["gain"]))
