@@ -243,6 +243,66 @@ when a new recording starts. `REC_MAX_MB` closes a recording that grows past
 the limit rather than filling the disk. Mount `REC_DIR` as a volume, otherwise
 the recordings disappear with the next container rebuild.
 
+## A negative meter target and a second AC storage
+
+A negative meter target tells the controller to keep a deliberate export at
+the meter. That is how you feed an AC-coupled storage unit that only starts
+charging when it sees surplus.
+
+Left alone, that would run away. The EP2500 exports to create surplus, the
+other unit absorbs it, the meter reads zero again, so the EP2500 exports more.
+Both units ramp until one of them hits its limit.
+
+The Shelly plugs in front of the AC storage units break that loop. Their
+measured charging power is subtracted from the request, so the target only
+asks for what is not already being absorbed:
+
+```
+requested -300 W, storage charging 0 W    -> effective target -300 W
+requested -300 W, storage charging 100 W  -> effective target -200 W
+requested -300 W, storage charging 300 W  -> effective target    0 W
+requested -300 W, storage charging 500 W  -> effective target    0 W
+```
+
+The contribution is capped at the request, so the compensation can never turn
+an export request into an import one.
+
+Two guards sit around it. A reading older than `AC_STORAGE_MAX_AGE` or a
+Shelly whose relay is off means the surplus has no taker, so the negative
+target is suspended and the controller falls back to zero export. And
+`AC_STORAGE_NOISE` ignores the few watts a plug reports when nothing is
+charging.
+
+### Worked example
+
+Discharge stop 15 %, pass-through target 90 %, meter target -300 W, one AC
+storage on a Shelly. PV is strong.
+
+| Step | Meter | Storage | Effective target | EP2500 export | Why |
+|---|---|---|---|---|---|
+| 1 | +40 W | 0 W | -300 W | rises | surplus has to be created first |
+| 2 | -290 W | 0 W | -300 W | steady | the other unit has not noticed yet |
+| 3 | -180 W | 110 W | -190 W | steady | it started; the request shrinks by what it takes |
+| 4 | -10 W | 290 W | -10 W | steady | nearly everything is absorbed |
+| 5 | 0 W | 300 W | 0 W | steady | balance reached, no runaway |
+| 6 | +260 W | 0 W | -300 W | rises | the other unit is full and stopped |
+
+Nothing escalates in step 5 because the export the EP2500 produces shows up in
+the Shelly reading and is deducted again.
+
+### What happens when the EP2500's own battery fills up
+
+Pass-through would pin the export limit at `LIMIT_MAX`, which overrides your
+meter target. It therefore stays out of the way while a target is set — but
+only up to a point. `PASS_OVERRIDE` points above the pass-through target,
+protection wins and pass-through engages anyway, with an event saying so.
+
+With the defaults that means: at 90 % nothing happens beyond a note in the
+event log that protection is being held back. At 93 % pass-through takes over
+and the meter target is suspended until the state of charge is back at 90 %.
+Running the device into its 100 % shutdown costs far more harvest than missing
+a meter target for half an hour.
+
 ## Pass-through: how it holds the state of charge
 
 Because there is no direct PV-to-grid path, a steady state of charge simply
