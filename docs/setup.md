@@ -257,7 +257,7 @@ skipped upward when the PV limit is not the binding constraint — under cloud
 the panels deliver less than the limit allows, and raising it further would
 only cause an overshoot when the sun returns.
 
-Set the target with `Durchleitung ab SoC`. Pass-through engages at that value
+Set the target with `Pass-through from SoC`. Pass-through engages at that value
 and then holds it, dropping back to zero-export control five points below.
 
 The PV charge power is capped at twice `LIMIT_MAX` while pass-through runs.
@@ -387,6 +387,36 @@ costs standby consumption even with nothing plugged in.
 Whether it also accepts export, from a balcony PV system for example, I have
 not tested. On the type plate the off-grid terminal is listed as output only.
 
+## The switch shows the permission, not the state
+
+DP 119 is the setting "off-grid output enabled". It is not a readout of
+whether the socket is actually live. The device can have the output shut down
+anyway and DP 119 still reads true. Home Assistant then shows the switch on
+while nothing comes out of the socket.
+
+The main reason is a lockout tied to the state of charge. **The device only
+releases the off-grid output once the state of charge is five points above the
+discharge stop.** Measured on 11.09.: discharge stop at 15 %, and both the
+socket and normal control came back at 20 %. Below that the device accepts
+DP 119 = true without complaint and simply leaves the output dead — which
+looks exactly like a bug in the bridge until you know about it.
+
+The bridge knows the rule now. Switching the socket on below the threshold
+still sends the command, but logs why it will not take effect yet, and the
+watchdog names the state of charge instead of blaming the device. If your unit
+uses a different margin, set `OFFGRID_SOC_MARGIN`.
+
+Every switch command is read back from the device a few seconds later. The
+EP2500 acknowledges commands it does not carry out, and without the read-back
+the requested value would sit in the cache and in Home Assistant.
+
+What the bridge cannot do is show you the real state of the socket, because
+no datapoint reports it. DP 135 looks like the obvious candidate and is not:
+it sits at 231 to 237 V no matter what, including overnight in standby with
+the output off. A watchdog built on it produced nothing but false alarms and
+was removed again. The state-of-charge lockout above is the one statement
+that holds up, so that is what gets reported.
+
 ## What idling costs
 
 Once the device reaches the discharge-stop SoC it goes to standby and stops
@@ -413,8 +443,8 @@ in the bridge — the bridge has no idea where you live or when the sun sets.
 
 ```yaml
 input_boolean:
-  ep2500_offgrid_nachtabschaltung:
-    name: EP2500 Off-Grid nachts aus
+  ep2500_offgrid_night_off:
+    name: EP2500 off-grid off at night
     icon: mdi:weather-night
 ```
 
@@ -428,26 +458,26 @@ and the entity ID will match.
 
 ```yaml
 - id: ep2500_offgrid_sonnenuntergang
-  alias: EP2500 - Off-Grid-Steckdose bei Sonnenuntergang aus
+  alias: EP2500 - off-grid socket off at sunset
   mode: single
   triggers:
     - trigger: sun
       event: sunset
   conditions:
     - condition: state
-      entity_id: input_boolean.ep2500_offgrid_nachtabschaltung
+      entity_id: input_boolean.ep2500_offgrid_night_off
       state: "on"
   actions:
     - action: switch.turn_off
       target:
-        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+        entity_id: switch.oukitel_ep2500_off_grid_socket
     - action: logbook.log
       data:
         name: EP2500
-        message: Off-Grid-Steckdose zum Sonnenuntergang abgeschaltet.
+        message: Off-grid socket switched off at sunset.
 
 - id: ep2500_offgrid_sonnenaufgang
-  alias: EP2500 - Off-Grid-Steckdose bei Sonnenaufgang an
+  alias: EP2500 - off-grid socket on at sunrise
   mode: single
   triggers:
     - trigger: sun
@@ -455,18 +485,18 @@ and the entity ID will match.
   actions:
     - action: switch.turn_on
       target:
-        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+        entity_id: switch.oukitel_ep2500_off_grid_socket
     - action: logbook.log
       data:
         name: EP2500
-        message: Off-Grid-Steckdose zum Sonnenaufgang eingeschaltet.
+        message: Off-grid socket switched on at sunrise.
 
 - id: ep2500_offgrid_sofort
-  alias: EP2500 - Off-Grid-Steckdose beim Umschalten angleichen
+  alias: EP2500 - align off-grid socket when the helper changes
   mode: single
   triggers:
     - trigger: state
-      entity_id: input_boolean.ep2500_offgrid_nachtabschaltung
+      entity_id: input_boolean.ep2500_offgrid_night_off
       to: "on"
   conditions:
     - condition: state
@@ -475,7 +505,7 @@ and the entity ID will match.
   actions:
     - action: switch.turn_off
       target:
-        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+        entity_id: switch.oukitel_ep2500_off_grid_socket
 ```
 
 The syntax above is for Home Assistant 2024.10 and later. On older versions
@@ -491,7 +521,7 @@ broken switch.
 The `logbook.log` entries are optional. They make it easy to line up a
 measurement night with what actually happened.
 
-Add a row for `input_boolean.ep2500_offgrid_nachtabschaltung` to the controls
+Add a row for `input_boolean.ep2500_offgrid_night_off` to the controls
 card in `dashboard.yaml` so the switch sits next to the socket it governs.
 
 ### Checking whether it helped

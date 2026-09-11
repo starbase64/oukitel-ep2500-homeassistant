@@ -42,6 +42,15 @@ There may be more that were not triggered during testing.
 active. It is the PV charge power actually in effect. No separate datapoint was
 found for PV charge power 1 – possibly identical with 156.
 
+**Note on DP 119 – off-grid socket:** this is the permission, not the state.
+The device releases the output only once the state of charge is five points
+above the discharge stop (DP 124). Below that it acknowledges a write and
+leaves the socket dead. There is no readout that tells you the actual
+state. DP 135 (off-grid voltage) looks like one but is not: across three
+measurement runs it never left the 231–237 V band — overnight in standby, with
+the output switched off, and on an empty battery alike. It appears to report
+an internal bus voltage rather than the socket.
+
 **Note on standby self-consumption:** after reaching the discharge-stop SoC
 the device goes to standby and stops feeding, but keeps draining the battery —
 measured at roughly 38 W, with the off-grid socket live at 0 A the whole time
