@@ -199,9 +199,9 @@ services:
       ECO_URL:      "http://YOUR_METER:PORT/v1/json"
       ECO_FIELD:    "power"
       ECO_INTERVAL: "5"
-      ECO_SPIKE:    "1500"
+      ECO_SPIKE:    "600"
       LIMIT_MAX:    "800"
-      LIMIT_SAFE:   "300"
+      LIMIT_SAFE:   "0"
       LOG_DPS:      "1"
       TZ:           "Europe/Berlin"
     logging:
@@ -213,6 +213,29 @@ services:
 
 Mind the indentation – in YAML it defines the structure. Check with
 `docker compose config` that the file parses.
+
+## Recording the log from the dashboard
+
+The **Protokoll aufzeichnen** switch tells the bridge to mirror everything it
+logs into a file under `REC_DIR`. A sensor next to it shows how long the
+recording has been running and how large it is.
+
+There is no download button, because a Home Assistant button can only send a
+command — it cannot hand you a file. The bridge therefore serves the
+recordings over HTTP on `REC_PORT`, and the dashboard shows a link to that
+page. Downloading works while a recording is still running; the file is
+flushed after every line.
+
+Two things to be aware of. The server has **no authentication** and will hand
+any file in `REC_DIR` to anyone who can reach the port, so keep it on the home
+network and do not forward it through a router. It only serves paths matching
+its own naming pattern, so it cannot be walked out of that directory, but that
+is not a substitute for keeping the port private.
+
+`REC_KEEP` bounds how many recordings are retained; older ones are deleted
+when a new recording starts. `REC_MAX_MB` closes a recording that grows past
+the limit rather than filling the disk. Mount `REC_DIR` as a volume, otherwise
+the recordings disappear with the next container rebuild.
 
 ## Pass-through: how it holds the state of charge
 
@@ -236,6 +259,17 @@ only cause an overshoot when the sun returns.
 
 Set the target with `Durchleitung ab SoC`. Pass-through engages at that value
 and then holds it, dropping back to zero-export control five points below.
+
+The PV charge power is capped at twice `LIMIT_MAX` while pass-through runs.
+It has to sit somewhat above `LIMIT_MAX` to cover the conversion loss — 800 W
+into the battery yields less than 800 W at the output — but it never needs to
+go far beyond that, and the cap keeps a stuck loop from opening the solar side
+wide.
+
+Pass-through does not need the meter, so a meter outage does not end it. The
+state-of-charge check keeps running, and the drop back to zero-export control
+five points below the target still happens; the zero-export branch then finds
+the stale meter reading and falls back to `GRID_FAIL_LIMIT`.
 
 While pass-through is active the harvest is capped at `LIMIT_MAX`. That is
 unavoidable on this device: the alternative is letting the battery reach the
@@ -352,6 +386,122 @@ costs standby consumption even with nothing plugged in.
 
 Whether it also accepts export, from a balcony PV system for example, I have
 not tested. On the type plate the off-grid terminal is listed as output only.
+
+## What idling costs
+
+Once the device reaches the discharge-stop SoC it goes to standby and stops
+feeding, but it keeps draining the battery. Over one night (09./10.09.) the
+state of charge fell from 15 % to 9 % at a steady one point per 79 to 80
+minutes — about 38 W on a 5 kWh pack. Remarkably linear across six hours.
+
+The socket was live throughout: DP 135 sat between 231 and 236 V while DP 140
+read 0 A. So the inverter was running an AC output for a socket with nothing
+in it. How much of the 38 W that accounts for is exactly what the automation
+below is meant to measure.
+
+Worth being clear about: the discharge stop protects the battery from the
+*controller*, not from the device itself. Over a long spell of bad weather the
+pack keeps draining below it.
+
+## Switching it off overnight
+
+Three automations and one helper. This belongs in Home Assistant rather than
+in the bridge — the bridge has no idea where you live or when the sun sets.
+`homeassistant/offgrid_nacht.yaml` holds the same YAML ready to copy.
+
+### configuration.yaml
+
+```yaml
+input_boolean:
+  ep2500_offgrid_nachtabschaltung:
+    name: EP2500 Off-Grid nachts aus
+    icon: mdi:weather-night
+```
+
+**If you already have an `input_boolean:` block, merge the indented entry into
+it.** A second `input_boolean:` key at the top level makes Home Assistant
+refuse to start with a duplicate key error. You can also create the helper
+through Settings > Devices & Services > Helpers instead; pick type "Toggle"
+and the entity ID will match.
+
+### automations.yaml
+
+```yaml
+- id: ep2500_offgrid_sonnenuntergang
+  alias: EP2500 - Off-Grid-Steckdose bei Sonnenuntergang aus
+  mode: single
+  triggers:
+    - trigger: sun
+      event: sunset
+  conditions:
+    - condition: state
+      entity_id: input_boolean.ep2500_offgrid_nachtabschaltung
+      state: "on"
+  actions:
+    - action: switch.turn_off
+      target:
+        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+    - action: logbook.log
+      data:
+        name: EP2500
+        message: Off-Grid-Steckdose zum Sonnenuntergang abgeschaltet.
+
+- id: ep2500_offgrid_sonnenaufgang
+  alias: EP2500 - Off-Grid-Steckdose bei Sonnenaufgang an
+  mode: single
+  triggers:
+    - trigger: sun
+      event: sunrise
+  actions:
+    - action: switch.turn_on
+      target:
+        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+    - action: logbook.log
+      data:
+        name: EP2500
+        message: Off-Grid-Steckdose zum Sonnenaufgang eingeschaltet.
+
+- id: ep2500_offgrid_sofort
+  alias: EP2500 - Off-Grid-Steckdose beim Umschalten angleichen
+  mode: single
+  triggers:
+    - trigger: state
+      entity_id: input_boolean.ep2500_offgrid_nachtabschaltung
+      to: "on"
+  conditions:
+    - condition: state
+      entity_id: sun.sun
+      state: below_horizon
+  actions:
+    - action: switch.turn_off
+      target:
+        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+```
+
+The syntax above is for Home Assistant 2024.10 and later. On older versions
+use `trigger:`, `condition:` and `action:` in the singular.
+
+Three automations rather than two, for reasons that only show up in use. The
+**sunrise** one has no condition on purpose: switch the helper off during the
+night and the socket should still come back in the morning, not stay dead
+until someone notices. The **third** one covers switching the helper on after
+sunset — without it nothing happens until the next evening, which looks like a
+broken switch.
+
+The `logbook.log` entries are optional. They make it easy to line up a
+measurement night with what actually happened.
+
+Add a row for `input_boolean.ep2500_offgrid_nachtabschaltung` to the controls
+card in `dashboard.yaml` so the switch sits next to the socket it governs.
+
+### Checking whether it helped
+
+No extra sensors needed. Take the state of charge while the device sits in
+standby and measure how long one percentage point takes. Before: 79 to 80
+minutes. If that roughly doubles, the socket was about half the idle draw.
+
+The comparison only works if the battery reaches the discharge stop in the
+evening and stays there overnight, so pick a night after a weak solar day.
 
 ---
 

@@ -42,6 +42,26 @@ There may be more that were not triggered during testing.
 active. It is the PV charge power actually in effect. No separate datapoint was
 found for PV charge power 1 – possibly identical with 156.
 
+**Note on standby self-consumption:** after reaching the discharge-stop SoC
+the device goes to standby and stops feeding, but keeps draining the battery —
+measured at roughly 38 W, with the off-grid socket live at 0 A the whole time
+(DP 135 at 231–236 V, DP 140 at 0). Details and a way to switch the socket off
+overnight are in [setup.md](setup.md), section "The off-grid socket".
+
+**Note on DP 149 – system fault:** the app shows this value in the storage
+menu labelled "system fault". A deliberately induced overload on the AC output
+set it to 128; the device dropped the grid side (DP 155, 137 and 139 all went
+to zero) and the value stayed at 128 for more than five minutes afterwards,
+with the battery already charging again. Only a restart of the device cleared
+it. Whether the datapoint is writable was never tested — the one attempt never
+reached the device.
+
+The value looks like a bit field: only 2 and 128 have been seen, both powers of
+two, and 2 appears in undisturbed operation alongside 101 and 114. That is an
+educated guess, not a proven fact. A combined value such as 130 would settle
+it. The bridge decodes bit 7 as the AC overload and reports every other bit
+honestly as unknown, with its numeric value.
+
 **Note on DP 122:** this is the single most important value on the device. It
 limits the total battery charge power, from PV as well as from the grid. Set to
 0, the device shuts down its MPPT controllers and takes no solar energy at all,
@@ -68,6 +88,7 @@ even with an empty battery and full sun. See the section on quirks below.
 | 137 | Grid power (mirrors 155) | W | likely |
 | 138 | Grid frequency | ÷100 → Hz | certain |
 | 139 | Grid voltage | ÷10 → V | certain |
+| 149 | System fault register, latched (see note) | – | – | certain |
 | 136 | Grid current | ÷10 → 0.8 A | certain |
 | 141 / 142 | Off-grid socket load, both registers identical | W | certain |
 | 140 | Off-grid output current | ÷10 → 8.7 A | certain |
@@ -130,11 +151,10 @@ been able to complete the pairing yet.
 | 129 | counter; once ran from 0 to 13 in 20 s, then reset to 0 | grid sync timer? |
 
 | 144 | constant 0 | – |
-| 149 | alternates between 0 and 2, often together with 101 and 114 | – |
 
 Also present in the app but not mapped to any datapoint: **battery status**,
-**battery protection**, **system fault** (storage menu), and **AC output
-voltage** and **current** (load menu).
+**battery protection** (storage menu), and **AC output voltage** and
+**current** (load menu).
 
 ---
 
