@@ -39,6 +39,10 @@ Regulation holds the grid connection at ±4 W.
 - **Log recording from the dashboard**: a switch starts mirroring the bridge's
   log into a file, and the bridge serves the recordings over HTTP so you can
   download them without shell access
+- **Signed meter target with AC-storage compensation**: aim for a deliberate
+  export so a second, AC-coupled storage unit starts charging. Shelly plugs in
+  front of those units measure what they absorb, and that is deducted from the
+  request, so the two controllers cannot ramp each other up
 - Estimated remaining runtime
 - Controller parameters adjustable from the dashboard, no restart needed
 - Event log covering the last 48 hours

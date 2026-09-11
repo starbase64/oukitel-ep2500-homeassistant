@@ -49,6 +49,9 @@ services:
       SHELLY2_IP:   ""
       # Shelly plugs measuring the input of up to two AC-coupled stores.
       # These can also be entered later in Home Assistant.
+      # Points above the pass-through target at which protection against the
+      # 100 % shutdown overrides a meter target. 0 disables the override.
+      PASS_OVERRIDE: "3"
       AC_STORAGE1_IP: ""
       AC_STORAGE2_IP: ""
       AC_STORAGE_MAX_AGE: "15"

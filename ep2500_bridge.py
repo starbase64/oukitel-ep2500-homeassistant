@@ -171,6 +171,12 @@ PASS_STEP_FAST = 150       # W per step in the alarm range
 PASS_ADJUST = 180          # s between two trim steps
 PASS_ADJUST_FAST = 45      # s in the alarm range
 PASS_ALARM = 3             # points above target = alarm range
+# A negative meter target deliberately exports, which conflicts with
+# pass-through pinning the export limit. Pass-through therefore stays out of
+# the way - but only until the state of charge gets close enough to the charge
+# stop that the 100 % shutdown becomes the bigger problem. From this many
+# points above the pass-through target, protection wins over the target.
+PASS_OVERRIDE = int(os.getenv("PASS_OVERRIDE", "3"))
 PASS_SETTLE = 120          # s of quiet after start before trimming
 
 # How long the device must have been out of standby before control resumes.
@@ -197,7 +203,7 @@ PLAUSI_MAX = {
 # Only these may sensibly be negative (the sign carries the direction).
 # PV power can never be negative - a negative value there is on overflow or a
 # measurement error and gets discarded.
-NEGATIV_ERLAUBT = {"128", "137"}
+NEGATIVE_OK = {"128", "137"}
 
 POLL_FULL = 60             # s between two full status polls
 VERIFY_DELAY = 6           # s before a switch command is read back
@@ -369,6 +375,7 @@ class RecordHandler(logging.Handler):
         self.file_name = None
         self.lines = 0
         self.started_at = None
+        self.aborted = None      # reason a recording ended by itself
 
     def emit(self, record):
         with self.file_lock:
@@ -379,7 +386,7 @@ class RecordHandler(logging.Handler):
                 self.fh.flush()
                 self.lines += 1
                 if self.lines % 500 == 0 and self._too_big():
-                    self._stop_intern("Groessengrenze erreicht")
+                    self._stop_intern(f"size limit of {REC_MAX_MB} MB reached")
             except Exception:
                 pass          # a broken recording must never disturb control
 
@@ -390,12 +397,23 @@ class RecordHandler(logging.Handler):
             return False
 
     def _stop_intern(self, reason_txt=""):
+        # The reason is only stored here, never reported. This runs inside
+        # emit() while the file lock is held, and event() would log again -
+        # straight back into emit(). publish_record_info() picks it up.
+        if reason_txt:
+            self.aborted = reason_txt
         if self.fh is not None:
             try:
                 self.fh.close()
             except Exception:
                 pass
         self.fh = None
+
+    def take_abort_reason(self):
+        """Returns and clears the reason a recording ended on its own."""
+        with self.file_lock:
+            reason_txt, self.aborted = self.aborted, None
+            return reason_txt
 
     def start(self):
         """Starts a new recording. Returns the file name, or None."""
@@ -620,6 +638,7 @@ class State:
         self.pass_pv_setpoint = 0      # W; trimmed PV charge power
         self.pass_next = 0.0       # time of the next trim step
         self.pass_pv_pending = False  # initial DP 156 write still pending?
+        self.pass_soc_warned = False  # warned that a meter target blocks it?
         self.pv_reopen = False     # PV limit still to reopen after pass-through?
         self.grid_fail = False     # meter failure already handled?
         self.setpoint = 0.0            # internal setpoint: >0 export, <0 charge
@@ -666,11 +685,11 @@ class State:
         changed = {}
         with self.lock:
             for k, v in dps.items():
-                grenze = PLAUSI_MAX.get(k)
-                if grenze is not None and isinstance(v, int):
+                plausi = PLAUSI_MAX.get(k)
+                if plausi is not None and isinstance(v, int):
                     if v >= UINT16_SCHWELLE:
                         v = v - 65536
-                    if abs(v) > grenze or (v < 0 and k not in NEGATIV_ERLAUBT):
+                    if abs(v) > plausi or (v < 0 and k not in NEGATIVE_OK):
                         log.warning("DP %s: %s W implausible - discarded", k, v)
                         continue
                 if self.dps.get(k) != v:
@@ -1279,7 +1298,7 @@ def on_message(client, userdata, msg):
             if val is not None:
                 val = max(0, min(100, int(val)))
                 res = tuya_call("set_value", int(dp), val)
-                ok, reason_txt = antwort_ok(res)
+                ok, reason_txt = response_ok(res)
                 if ok:
                     log_changes(st.merge({dp: val}), "(HA)")
                     event(f"{name} set to {val} %")
@@ -1344,7 +1363,7 @@ def on_message(client, userdata, msg):
     if topic == f"{BASE}/offgrid/set":
         on = payload.upper() == "ON"
         res = tuya_call("set_value", int(DP_OFFGRID), on)
-        ok, reason_txt = antwort_ok(res)
+        ok, reason_txt = response_ok(res)
         if ok:
             st.merge({DP_OFFGRID: on})
         if ok:
@@ -1604,7 +1623,7 @@ def process_tuya_requests(d, maximum=32):
             request.done.set()
 
 
-def antwort_ok(res):
+def response_ok(res):
     """Checks TinyTuya's reply to a write.
 
     TinyTuya does not raise on errors; it returns a dict with on "Error" key.
@@ -1626,7 +1645,7 @@ def write_dp(dp, watt, vmax, reason=""):
             DP_PV_LIMIT: "PV limit"}.get(dp, f"DP {dp}")
     res = tuya_call("set_value", int(dp), watt)
 
-    ok, reason_txt = antwort_ok(res)
+    ok, reason_txt = response_ok(res)
     if not ok:
         log.warning("%s -> %s W rejected: %s", name, watt, reason_txt)
         return False
@@ -1647,6 +1666,9 @@ def set_charge(watt, reason=""):
 
 def publish_record_info():
     """Publishes the recording state for the dashboard."""
+    aborted = recorder.take_abort_reason()
+    if aborted:
+        event(f"Recording stopped on its own: {aborted}")
     i = recorder.info()
     if i["active"]:
         text = (f"running for {i['minutes']} min - {i['lines']} lines, "
@@ -2120,7 +2142,7 @@ def set_backflow(block, source=""):
     from the grid.
     """
     res = tuya_call("set_value", int(DP_BACKFLOW), bool(block))
-    ok, reason_txt = antwort_ok(res)
+    ok, reason_txt = response_ok(res)
     if not ok:
         log.warning("Backflow prevention rejected: %s", reason_txt)
         return False
@@ -2248,13 +2270,43 @@ def control_loop():
         # than the rule - hence one small step every few minutes is enough.
         soc = dps.get("102")
         target = st.tune["soc_pass"]
-        if (st.pass_on and requested_target == 0
-                and isinstance(soc, (int, float))):
+        if st.pass_on and isinstance(soc, (int, float)):
             # Hysteresis: once active it stays until PASS_HYST below target
-            grenze = target - PASS_HYST if st.pass_active else target
-            active = soc >= grenze
+            threshold = target - PASS_HYST if st.pass_active else target
+            reached = soc >= threshold
+            if requested_target == 0:
+                active = reached
+            else:
+                # A negative or positive meter target normally wins: the user
+                # asked for a specific figure at the meter, and pass-through
+                # would override it with a fixed LIMIT_MAX.
+                #
+                # That deference ends near the charge stop. Letting the device
+                # run into its 100 % shutdown costs far more than missing a
+                # meter target for a while, and the protection was silently
+                # off here before - the check used the requested target, so
+                # even a target the AC-storage compensation had already
+                # neutralised to 0 disabled it.
+                # Hysteresis on the override as well: it engages PASS_OVERRIDE
+                # points above the target and only lets go once the state of
+                # charge is back at the target. Without that it would chatter
+                # on and off across a single point.
+                override_at = target if st.pass_active else target + PASS_OVERRIDE
+                active = reached and soc >= override_at
+                if active and not st.pass_active:
+                    event(f"Meter target {requested_target:+d} W suspended - "
+                          f"state of charge {soc} % is within "
+                          f"{PASS_OVERRIDE} points of the pass-through target")
+                elif reached and not active and not st.pass_soc_warned:
+                    st.pass_soc_warned = True
+                    event(f"Pass-through held back by meter target "
+                          f"{requested_target:+d} W at {soc} % - protection "
+                          f"takes over at {target + PASS_OVERRIDE} %")
+            if not reached:
+                st.pass_soc_warned = False
         else:
             active = False
+            st.pass_soc_warned = False
 
         if active != st.pass_active:
             if active:
@@ -2388,7 +2440,7 @@ def control_loop():
         # controller put it there itself, do not pause - otherwise it would
         # never start up again.
         idle = (is_standby(status) and actual == 0.0 and limit >= 20
-                    and error > 0)
+                and error > 0)
         if idle:
             if not st.idle_logged:
                 event("Control paused - device in standby, "
