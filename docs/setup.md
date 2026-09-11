@@ -384,6 +384,20 @@ Check the entity IDs if cards stay empty – HA derives them from the names, and
 umlauts are not always transliterated the same way. Look under Settings →
 Devices & Services → Entities, filter "ep2500".
 
+For an installation upgraded from the old German entity names, use the bundled
+registry-aware converter instead of changing dozens of dashboard rows by hand:
+
+```bash
+cd /home/maik/docker/ep2500
+python3 tools/fix_dashboard_ids.py \
+  /home/maik/docker/homeassistant \
+  dashboard.yaml dashboard.local.yaml
+```
+
+The generated `dashboard.local.yaml` uses the entity IDs that actually exist
+on that HA installation. If MQTT entities are reported missing, restart the
+bridge so that it republishes discovery and run the command again.
+
 The event log card only scrolls with **card-mod** from HACS:
 
 ```yaml
@@ -539,7 +553,7 @@ pack keeps draining below it.
 
 Four automations and one helper. This belongs in Home Assistant rather than
 in the bridge — the bridge has no idea where you live or when the sun sets.
-`homeassistant/offgrid_nacht.yaml` contains the automations and
+`homeassistant/offgrid_night.yaml` contains the automations and
 `homeassistant/input_boolean.yaml` contains the helper ready to include.
 
 ### configuration.yaml
@@ -560,7 +574,7 @@ and the entity ID will match.
 ### automations.yaml
 
 ```yaml
-- id: ep2500_offgrid_sonnenuntergang
+- id: ep2500_offgrid_sunset
   alias: EP2500 - off-grid socket off at sunset
   mode: single
   triggers:
@@ -579,7 +593,7 @@ and the entity ID will match.
         name: EP2500
         message: Off-grid socket switched off at sunset.
 
-- id: ep2500_offgrid_sonnenaufgang
+- id: ep2500_offgrid_sunrise
   alias: EP2500 - off-grid socket on at sunrise
   mode: single
   triggers:
@@ -598,7 +612,7 @@ and the entity ID will match.
         name: EP2500
         message: Off-grid socket switched on at sunrise.
 
-- id: ep2500_offgrid_sofort
+- id: ep2500_offgrid_apply_now
   alias: EP2500 - align off-grid socket when the helper changes
   mode: single
   triggers:
@@ -616,7 +630,7 @@ and the entity ID will match.
       target:
         entity_id: switch.oukitel_ep2500_off_grid_socket
 
-- id: ep2500_offgrid_helfer_aus
+- id: ep2500_offgrid_helper_off
   alias: EP2500 - restore off-grid socket when night switch is disabled
   mode: single
   triggers:
