@@ -35,7 +35,7 @@ Regulation holds the grid connection at ±4 W.
 - Optional Home Assistant automation that switches the off-grid socket off
   overnight. The device keeps the socket energised at idle, and standby draw
   measured out at roughly 38 W — see "The off-grid socket" in
-  [docs/setup.md](docs/setup.md), YAML in `homeassistant/offgrid_nacht.yaml`
+  [docs/setup.md](docs/setup.md), YAML in `homeassistant/offgrid_night.yaml`
 - **Log recording from the dashboard**: a switch starts mirroring the bridge's
   log into a file, and the bridge serves the recordings over HTTP so you can
   download them without shell access
@@ -139,13 +139,31 @@ and merely displays as "State of charge". Your history and statistics survive.
 because that is what a fresh install produces. On an upgraded instance it will
 therefore show unavailable rows. Two ways out:
 
-- Keep your own copy of the dashboard with the old IDs. Nothing else is
-  affected.
-- Or rename the entities under Settings > Devices & Services > Entities so they
-  match the new scheme, then take the dashboard from here. Renaming an entity
-  moves its history with it.
+- **Recommended:** generate a dashboard for the entity IDs already stored in
+  your HA registry. This preserves names, history and statistics:
 
-The helper for the off-grid night switch was also renamed, from
-`input_boolean.ep2500_offgrid_nachtabschaltung` to
-`input_boolean.ep2500_offgrid_night_off`. That one is yours, not the bridge's,
-so it has to be renamed by hand if you already created it.
+  ```bash
+  cd /home/maik/docker/ep2500
+  python3 tools/fix_dashboard_ids.py \
+    /home/maik/docker/homeassistant \
+    dashboard.yaml dashboard.local.yaml
+  ```
+
+  Restart the bridge first if the tool reports missing MQTT entities. Then
+  paste `dashboard.local.yaml` into the dashboard's raw configuration editor,
+  or copy it into HA's dashboard directory.
+- Alternatively, rename every entity under Settings > Devices & Services >
+  Entities so it matches the new scheme and use `dashboard.yaml` unchanged.
+  Renaming an entity in HA preserves its history.
+
+The repair tool resolves every dashboard reference through the stable MQTT
+`unique_id`. It also reports missing entities, unknown dashboard references and
+duplicate MQTT unique IDs instead of silently producing a partly broken view.
+
+The helper and the automations for the off-grid night switch carry English
+names too. If you created them from an earlier build, the helper is now
+`input_boolean.ep2500_offgrid_night_off` and the automation IDs are
+`ep2500_offgrid_sunset`, `ep2500_offgrid_sunrise`, `ep2500_offgrid_apply_now`
+and `ep2500_offgrid_helper_off`. Those files are yours, not the bridge's, so
+rename them by hand — or leave them as they are and skip
+`homeassistant/offgrid_night.yaml`, since nothing else refers to those IDs.

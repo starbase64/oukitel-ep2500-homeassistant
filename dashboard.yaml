@@ -210,10 +210,12 @@ views:
                 name: Status
           - type: markdown
             content: >-
-              {% set url = state_attr('sensor.oukitel_ep2500_recording',
-              'url') %} {% if url %} <ha-alert alert-type="info">[Recordingen
-              herunterladen]({{ url }})</ha-alert> {% else %} _Download-Adresse
-              not reported yet._ {% endif %}
+              {% set url = state_attr('sensor.oukitel_ep2500_recording', 'url')
+              %} {% if url %} <ha-alert alert-type="info">[Download
+              recordings]({{ url }})</ha-alert> {% else %} <ha-alert
+              alert-type="warning">No download address. Set `REC_HOST` in
+              docker-compose.yml to this machine's address.</ha-alert> {% endif
+              %}
           - type: entities
             title: Controller fine-tuning
             show_header_toggle: false
@@ -274,7 +276,7 @@ views:
                 }
             content: >-
               {% set liste = state_attr('sensor.oukitel_ep2500_events',
-              'eintraege') %}
+              'entries') %}
 
               {% if liste %} {% for e in liste | reverse | list %} **{{ e.t }}** ·
               {{ e.m }}

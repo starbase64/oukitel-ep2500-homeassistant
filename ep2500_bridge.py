@@ -138,7 +138,7 @@ TUNABLES = {
     "gain":     ("Controller gain", 0.1, 2.0, 0.1, None, float),
     "deadband": ("Deadband",          0,   200, 5,   "W", int),
     "max_step": ("Max step", 10,  800, 10,  "W", int),
-    "charge_limit": ("Battery charge limit", 0, CHARGE_HW_MAX, 100, "W", int),
+    "charge_limit": ("Charge limit guard", 0, CHARGE_HW_MAX, 100, "W", int),
     "soc_pass":  ("Pass-through from SoC", 50, 100, 1, "%", int),
     "pv_max":    ("PV limit when open", 500, 4000, 100, "W", int),
 }
@@ -189,10 +189,10 @@ PASS_PV_CAP = 2 * LIMIT_MAX  # W; pass-through never needs more
 
 # The device reports some values as unsigned 16-bit numbers. 65535 is then not
 # a power reading but -1. Above this threshold the value is converted back;
-# anything beyond PLAUSI_MAX afterwards counts as invalid and is discarded, so
+# anything beyond PLAUSIBLE_MAX afterwards counts as invalid and is discarded, so
 # neither the display nor the energy counters get corrupted.
 UINT16_SCHWELLE = 32768
-PLAUSI_MAX = {
+PLAUSIBLE_MAX = {
     "143": 5000,    # PV total, device takes 4000 W max
     "147": 1200, "151": 1200, "164": 1200, "180": 1200,   # je String max 1000 W
     "155": 3000,    # AC-Ausgang
@@ -314,7 +314,7 @@ EVENT_MAX_AGE = 48 * 3600   # s; older events are dropped
 EVENT_MAX = 200             # safety cap on the attribute size
 
 
-def event(text, auch_loggen=True):
+def event(text, also_log=True):
     """Records on event for display in Home Assistant."""
     now_ts = time.time()
     with st.lock:
@@ -326,13 +326,13 @@ def event(text, auch_loggen=True):
         st.events = [e for e in st.events if now_ts - e["ts"] <= EVENT_MAX_AGE
                      ][-EVENT_MAX:]
         liste = list(st.events)
-    if auch_loggen:
+    if also_log:
         log.info("%s", text)
     try:
         mqttc.publish(f"{BASE}/events", json.dumps({
             "last": text[:250],
-            "anzahl": len(liste),
-            "eintraege": liste,
+            "count": len(liste),
+            "entries": liste,
         }), retain=True)
     except Exception as exc:
         log.debug("Could not publish event: %s", exc)
@@ -685,7 +685,7 @@ class State:
         changed = {}
         with self.lock:
             for k, v in dps.items():
-                plausi = PLAUSI_MAX.get(k)
+                plausi = PLAUSIBLE_MAX.get(k)
                 if plausi is not None and isinstance(v, int):
                     if v >= UINT16_SCHWELLE:
                         v = v - 65536
@@ -813,7 +813,7 @@ def publish_discovery(client):
         "name": "Controller setpoint",
         "unique_id": "ep2500_soll",
         "state_topic": f"{BASE}/state",
-        "value_template": "{{ value_json.soll }}",
+        "value_template": "{{ value_json.setpoint }}",
         "unit_of_measurement": "W",
         "device_class": "power",
         "state_class": "measurement",
@@ -1081,8 +1081,8 @@ def publish_discovery(client):
         "state_topic": f"{BASE}/events",
         "value_template": "{{ value_json.last[:250] }}",
         "json_attributes_topic": f"{BASE}/events",
-        "json_attributes_template": "{{ {'eintraege': value_json.eintraege, "
-                                    "'anzahl': value_json.anzahl} | tojson }}",
+        "json_attributes_template": "{{ {'entries': value_json.entries, "
+                                    "'count': value_json.count} | tojson }}",
         "icon": "mdi:format-list-bulleted",
         "entity_category": "diagnostic",
         "availability_topic": f"{BASE}/available",
@@ -1218,7 +1218,7 @@ def on_message(client, userdata, msg):
         if "events" not in st.restored:
             st.restored.add("events")
             try:
-                old = json.loads(payload).get("eintraege", [])
+                old = json.loads(payload).get("entries", [])
                 now_ts = time.time()
                 with st.lock:
                     st.events = [e for e in old
@@ -1344,7 +1344,15 @@ def on_message(client, userdata, msg):
     if topic == f"{BASE}/record/set":
         on = payload.upper() == "ON"
         if on:
-            name = recorder.starten()
+            # Any exception here would be swallowed by the MQTT callback and
+            # the switch would simply do nothing - which is exactly how the
+            # renamed start()/stop() methods went unnoticed.
+            try:
+                name = recorder.start()
+            except Exception as exc:
+                log.exception("Starting the recording failed")
+                event(f"Starting the recording failed: {exc}")
+                name = None
             if name:
                 event(f"Recording started: {name}")
             else:
@@ -1353,7 +1361,12 @@ def on_message(client, userdata, msg):
                 event("Recording could not be started")
                 on = False
         else:
-            name = recorder.stoppen()
+            try:
+                name = recorder.stop()
+            except Exception as exc:
+                log.exception("Stopping the recording failed")
+                event(f"Stopping the recording failed: {exc}")
+                name = None
             if name:
                 event(f"Recording stopped: {name}")
         client.publish(f"{BASE}/record/state", "ON" if on else "OFF", retain=True)
@@ -1678,7 +1691,10 @@ def publish_record_info():
     else:
         text = "no recording"
     i["text"] = text
-    i["url"] = f"http://{REC_HOST}:{REC_PORT}/"
+    # Without REC_HOST there is no address to offer. Publishing
+    # "http://:8099/" would put a dead link on the dashboard.
+    i["url"] = f"http://{REC_HOST}:{REC_PORT}/" if REC_HOST else ""
+    i["port"] = REC_PORT
     mqttc.publish(f"{BASE}/record/state",
                   "ON" if i["active"] else "OFF", retain=True)
     mqttc.publish(f"{BASE}/record/info", json.dumps(i), retain=True)
@@ -1698,7 +1714,7 @@ def publish_state():
         out["limit"] = dps[DP_LIMIT]
     if DP_CHARGE in dps:
         out["charge"] = dps[DP_CHARGE]
-    out["soll"] = int(round(st.setpoint))
+    out["setpoint"] = int(round(st.setpoint))
     out["passthrough"] = st.pass_active
     storage_power, storage_ready, storage_configured = ac_storage_charge_power()
     out["ac_storage_charge_power"] = round(storage_power)
@@ -1746,7 +1762,7 @@ def tuya_loop():
             d = connect_device()
             data = d.status()
             if not (isinstance(data, dict) and "dps" in data):
-                raise RuntimeError(f"Status fehlgeschlagen: {data}")
+                raise RuntimeError(f"Status query failed: {data}")
             # After a reconnect, comparing against the cache shows what
             # changed meanwhile - through the Oukitel app, for instance.
             log_changes(st.merge(data["dps"]), "(full status)")
@@ -1792,7 +1808,7 @@ def tuya_loop():
             st.online = False
             mqttc.publish(f"{BASE}/available", "offline", retain=True)
             if not st.was_offline:
-                event(f"Connection to the device lost ({exc})", auch_loggen=False)
+                event(f"Connection to the device lost ({exc})", also_log=False)
                 st.was_offline = True
             log.warning("Connection lost (%s), retrying in 15 s", exc)
             time.sleep(15)
@@ -1853,7 +1869,7 @@ def accept_meter_value(val, source=""):
                  jump, val)
         return False
     if message:
-        event(message, auch_loggen=False)
+        event(message, also_log=False)
     mqttc.publish(f"{BASE}/grid", int(val))
     return True
 
@@ -1886,7 +1902,7 @@ def eco_loop():
                 continue
 
             if fails >= 5:
-                event("Eco Tracker reachable again", auch_loggen=False)
+                event("Eco Tracker reachable again", also_log=False)
             fails = 0
 
         except Exception as exc:
@@ -1894,7 +1910,7 @@ def eco_loop():
             if fails in (1, 5) or fails % 20 == 0:
                 log.warning("Eco Tracker unreachable (%dx): %s", fails, exc)
                 if fails == 5:
-                    event("Eco Tracker is not responding", auch_loggen=False)
+                    event("Eco Tracker is not responding", also_log=False)
 
         time.sleep(ECO_INTERVAL)
 
@@ -1964,7 +1980,7 @@ def shelly_poll(nr):
                 setattr(st, f"{key}_ts", time.time())
         fails = getattr(st, f"{key}_fails")
         if fails >= 5:
-            event(f"{name} reachable again ({ip})", auch_loggen=False)
+            event(f"{name} reachable again ({ip})", also_log=False)
         setattr(st, f"{key}_fails", 0)
         mqttc.publish(topic, json.dumps({
             "power": round(power) if power is not None else None,
@@ -1977,7 +1993,7 @@ def shelly_poll(nr):
         if fails in (1, 5) or fails % 60 == 0:
             log.warning("%s %s unreachable (%dx): %s", name, ip, fails, exc)
         if fails == 5:
-            event(f"{name} {ip} is not responding", auch_loggen=False)
+            event(f"{name} {ip} is not responding", also_log=False)
 
 
 def shelly_loop(nr):
@@ -2514,6 +2530,10 @@ def main():
     threading.Thread(target=offgrid_watch_loop, daemon=True).start()
     for nr in (1, 2, 3, 4):
         threading.Thread(target=shelly_loop, args=(nr,), daemon=True).start()
+    if not REC_HOST:
+        log.warning("REC_HOST is not set - recordings still work, but the "
+                    "dashboard cannot offer a download link. Set it to the "
+                    "address of this machine, port %s.", REC_PORT)
     threading.Thread(target=record_server_loop, daemon=True).start()
     threading.Thread(target=record_info_loop, daemon=True).start()
 
