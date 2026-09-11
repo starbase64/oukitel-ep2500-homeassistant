@@ -183,6 +183,19 @@ PLAUSI_MAX = {
 NEGATIV_ERLAUBT = {"128", "137"}
 
 POLL_FULL = 60             # s zwischen zwei Vollstatus-Abfragen
+VERIFY_DELAY = 6           # s bis zur Nachpruefung eines Schaltbefehls
+
+# DP 135 taugt NICHT als Zustandsanzeige fuer die Off-Grid-Steckdose. Ueber
+# drei Messreihen hinweg lag der Wert immer zwischen 231 und 237 V - auch
+# nachts im Standby, auch bei abgeschaltetem Ausgang, auch bei leerem Akku.
+# Offenbar wird eine interne Busspannung gemeldet und nicht die Dose. Ein
+# Waechter darauf hat nur Fehlalarme erzeugt und ist wieder ausgebaut.
+
+# Das Geraet gibt den Off-Grid-Ausgang erst wieder frei, wenn der Ladestand
+# den Entlade-Stopp um diesen Abstand ueberschreitet. Darunter nimmt es das
+# Setzen von DP 119 zwar an, der Ausgang bleibt aber tot. Am 11.09. gemessen:
+# Entlade-Stopp 15 %, Ausgang und Regelung kamen bei 20 % zurueck.
+OFFGRID_SOC_MARGIN = int(os.getenv("OFFGRID_SOC_MARGIN", "5"))
 HEARTBEAT = 9              # s
 
 # Aenderungen einzelner Datenpunkte mitschreiben. Zum Erforschen unbekannter
@@ -581,6 +594,7 @@ class State:
         self.restored = set()      # welche Werte kamen schon aus MQTT zurueck
         self.idle_logged = False   # Leerlauf-Sperre bereits gemeldet?
         self.idle_since = 0.0      # zuletzt im Leerlauf gesehen
+        self.offgrid_gemeldet = False
         self.fehler_gemeldet = None  # zuletzt als Ereignis gemeldeter DP 149
         self.pass_on = False       # Durchleitung freigegeben?
         self.pass_aktiv = False    # Durchleitung laeuft gerade?
@@ -827,8 +841,7 @@ def publish_discovery(client):
     client.publish(f"{DISC}/text/ep2500/shelly2_ip/config", json.dumps({
         "name": "Nord-BKW Shelly IP",
         "unique_id": "ep2500_shelly2_ip",
-        "state_topic": f"{BASE}/shelly2",
-        "value_template": "{{ value_json.ip }}",
+        "state_topic": f"{BASE}/shelly2_ip",
         "command_topic": f"{BASE}/shelly2_ip/set",
         "entity_category": "config",
         "availability_topic": f"{BASE}/available",
@@ -992,7 +1005,8 @@ def publish_discovery(client):
     # Abgeloeste Entitaeten entfernen (leere Payload loescht sie in HA)
     for pfad in ("switch/ep2500/gridcharge", "number/ep2500/tune_charge_max",
                  "number/ep2500/tune_hyst", "sensor/ep2500/pv_strings",
-                 "number/ep2500/tune_pass_marge"):
+                 "number/ep2500/tune_pass_marge",
+                 "binary_sensor/ep2500/offgrid_live"):
         client.publish(f"{DISC}/{pfad}/config", "", retain=True)
 
     log.info("Discovery veroeffentlicht")
@@ -1021,6 +1035,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{BASE}/events")
     client.subscribe(f"{BASE}/passthrough/state")
     client.subscribe(f"{BASE}/shelly_ip")
+    client.subscribe(f"{BASE}/shelly2_ip")
 
     # Nach einem MQTT-Reconnect den Verfuegbarkeitsstatus erneut senden,
     # sonst zeigt HA die Entitaeten dauerhaft als nicht verfuegbar an.
@@ -1037,6 +1052,8 @@ def publish_settings():
                       "ON" if st.control_on else "OFF", retain=True)
     if "shelly_ip" not in st.restored:
         mqttc.publish(f"{BASE}/shelly_ip", st.shelly_ip, retain=True)
+    if "shelly2_ip" not in st.restored:
+        mqttc.publish(f"{BASE}/shelly2_ip", st.shelly2_ip, retain=True)
     if "passthrough" not in st.restored:
         mqttc.publish(f"{BASE}/passthrough/state",
                       "ON" if st.pass_on else "OFF", retain=True)
@@ -1101,7 +1118,19 @@ def on_message(client, userdata, msg):
 
     if topic == f"{BASE}/shelly2_ip/set":
         st.shelly2_ip = payload.strip()
-        log.info("Nord-BKW Shelly-Adresse auf %s geaendert", st.shelly2_ip)
+        st.shelly2_fails = 0
+        st.restored.add("shelly2_ip")
+        # Wie bei der ersten Adresse retained veroeffentlichen, sonst ist die
+        # Eingabe nach dem naechsten Neustart wieder weg.
+        client.publish(f"{BASE}/shelly2_ip", st.shelly2_ip, retain=True)
+        event(f"Nord-BKW Shelly-Adresse auf {st.shelly2_ip} geaendert")
+        return
+
+    if topic == f"{BASE}/shelly2_ip":
+        if "shelly2_ip" not in st.restored and payload:
+            st.shelly2_ip = payload
+            st.restored.add("shelly2_ip")
+            log.info("Nord-BKW Shelly-Adresse %s (gespeichert)", payload)
         return
 
     if topic == f"{BASE}/shelly/set":
@@ -1128,7 +1157,7 @@ def on_message(client, userdata, msg):
                             res = _dev.set_value(int(dp), val)
                             ok, grund = antwort_ok(res)
                             if ok:
-                                st.merge({dp: val})
+                                log_changes(st.merge({dp: val}), "(HA)")
                                 event(f"{name} auf {val} % gesetzt")
                             else:
                                 log.warning("%s abgelehnt: %s", name, grund)
@@ -1155,10 +1184,15 @@ def on_message(client, userdata, msg):
 
     if topic == f"{BASE}/backflow/set":
         sperren = payload.upper() == "ON"
-        set_backflow(sperren, quelle="HA")
-        event("Rueckflussverhinderung "
-              + ("eingeschaltet - Einspeisung gesperrt" if sperren
-                 else "ausgeschaltet - Einspeisung moeglich"))
+        if set_backflow(sperren, quelle="HA"):
+            event("Rueckflussverhinderung "
+                  + ("eingeschaltet - Einspeisung gesperrt" if sperren
+                     else "ausgeschaltet - Einspeisung moeglich"))
+            threading.Timer(VERIFY_DELAY, schalter_nachpruefen,
+                            (DP_BACKFLOW, sperren,
+                             "Rueckflussverhinderung")).start()
+        else:
+            event("Rueckflussverhinderung schalten fehlgeschlagen")
         publish_state()
         return
 
@@ -1184,6 +1218,7 @@ def on_message(client, userdata, msg):
 
     if topic == f"{BASE}/offgrid/set":
         an = payload.upper() == "ON"
+        ok, grund = False, "keine Verbindung"
         with _dev_lock:
             if _dev is not None:
                 try:
@@ -1191,11 +1226,27 @@ def on_message(client, userdata, msg):
                     ok, grund = antwort_ok(res)
                     if ok:
                         st.merge({DP_OFFGRID: an})
-                    else:
-                        log.warning("Off-Grid-Steckdose abgelehnt: %s", grund)
                 except Exception as exc:
-                    log.error("Off-Grid-Steckdose schalten fehlgeschlagen: %s", exc)
-        event("Off-Grid-Steckdose " + ("eingeschaltet" if an else "ausgeschaltet"))
+                    grund = str(exc)
+        if ok:
+            event("Off-Grid-Steckdose "
+                  + ("eingeschaltet" if an else "ausgeschaltet"))
+            gesperrt, soc, schwelle = offgrid_gesperrt(st.snapshot())
+            if an and gesperrt:
+                # Das Geraet nimmt den Befehl an, fuehrt ihn aber nicht aus.
+                # Ohne diesen Hinweis sieht es wie ein Fehler der Bridge aus.
+                event(f"Hinweis: Ladestand {soc} %, der Ausgang kommt erst "
+                      f"ab {schwelle} % zurueck (Entlade-Stopp "
+                      f"+{OFFGRID_SOC_MARGIN})")
+            # Der Cache steht jetzt auf dem angeforderten Wert. Ob das Geraet
+            # ihn wirklich uebernommen hat, zeigt erst ein Blick danach.
+            threading.Timer(VERIFY_DELAY, schalter_nachpruefen,
+                            (DP_OFFGRID, an, "Off-Grid-Steckdose")).start()
+        else:
+            # Frueher wurde das Ereignis auch bei einer Ablehnung gemeldet -
+            # im Protokoll stand dann eine Schalthandlung, die nie stattfand.
+            log.warning("Off-Grid-Steckdose abgelehnt: %s", grund)
+            event(f"Off-Grid-Steckdose schalten fehlgeschlagen: {grund}")
         publish_state()
         return
 
@@ -1689,6 +1740,32 @@ def shelly_schalten(an, nr=1):
         return False
 
 
+def offgrid_watch_loop():
+    """Meldet, solange der Ladestand den Off-Grid-Ausgang blockiert.
+
+    Es gibt keinen Datenpunkt, der den tatsaechlichen Zustand der Steckdose
+    verraet - DP 135 meldet durchgehend rund 235 V, unabhaengig davon, ob am
+    Ausgang etwas anliegt. Die einzige belastbare Aussage ist deshalb die
+    Sperre: unterhalb von Entlade-Stopp plus OFFGRID_SOC_MARGIN gibt das
+    Geraet den Ausgang nicht frei, egal was DP 119 sagt.
+    """
+    while True:
+        time.sleep(20)
+        if not st.online:
+            continue
+        dps = st.snapshot()
+        if not dps.get(DP_OFFGRID):
+            continue                      # nicht freigegeben, nichts zu melden
+        gesperrt, soc, schwelle = offgrid_gesperrt(dps)
+        if gesperrt and not st.offgrid_gemeldet:
+            st.offgrid_gemeldet = True
+            event(f"Off-Grid-Ausgang freigegeben, aber gesperrt: Ladestand "
+                  f"{soc} %, das Geraet gibt ihn erst ab {schwelle} % frei")
+        elif not gesperrt and st.offgrid_gemeldet:
+            st.offgrid_gemeldet = False
+            event(f"Off-Grid-Ausgang wieder freigegeben (Ladestand {soc} %)")
+
+
 def charge_guard_loop():
     """Haelt die Batterieladegrenze (DP 122) auf dem eingestellten Wert.
 
@@ -1720,6 +1797,56 @@ def set_pv_limit(watt, reason=""):
     wenn in der App ein PV-Zeitplan hinterlegt ist.
     """
     return write_dp(DP_PV_LIMIT, watt, 4000, reason)
+
+
+def offgrid_gesperrt(dps):
+    """Prueft, ob der Ladestand den Off-Grid-Ausgang blockiert.
+
+    Rueckgabe: (gesperrt, ladestand, schwelle). Ohne brauchbare Werte gilt
+    nichts als gesperrt - lieber keine Meldung als eine falsche.
+    """
+    soc = dps.get("102")
+    soc_min = dps.get(DP_SOC_MIN)
+    if not isinstance(soc, (int, float)) or not isinstance(soc_min, (int, float)):
+        return False, soc, None
+    schwelle = soc_min + OFFGRID_SOC_MARGIN
+    return soc < schwelle, soc, schwelle
+
+
+def geraet_status_lesen():
+    """Holt einen Vollstatus und uebernimmt ihn. Rueckgabe: dps oder None."""
+    with _dev_lock:
+        if _dev is None:
+            return None
+        try:
+            data = _dev.status()
+        except Exception as exc:
+            log.warning("Statusabfrage fehlgeschlagen: %s", exc)
+            return None
+    if not (isinstance(data, dict) and "dps" in data):
+        return None
+    log_changes(st.merge(data["dps"]), "(Nachpruefung)")
+    return data["dps"]
+
+
+def schalter_nachpruefen(dp, erwartet, name):
+    """Liest nach einem Schaltbefehl nach, ob das Geraet ihn umgesetzt hat.
+
+    Das Geraet quittiert Befehle auch dann mit OK, wenn es sie anschliessend
+    nicht ausfuehrt oder sofort wieder zuruecknimmt. Ohne Nachpruefung stuende
+    der angeforderte Wert im Cache und damit in Home Assistant, waehrend am
+    Geraet etwas anderes anliegt - genau der Fall, der am 11.09. auffiel:
+    Steckdose am Geraet aus, in HA an.
+    """
+    dps = geraet_status_lesen()
+    if dps is None or dp not in dps:
+        return
+    ist = bool(dps[dp])
+    if ist != bool(erwartet):
+        event(f"{name}: Geraet meldet "
+              f"{'ein' if ist else 'aus'}, angefordert war "
+              f"{'ein' if erwartet else 'aus'} - Anzeige korrigiert")
+    publish_state()
 
 
 def set_backflow(sperren, quelle=""):
@@ -2046,6 +2173,7 @@ def main():
     threading.Thread(target=tuya_loop, daemon=True).start()
     threading.Thread(target=control_loop, daemon=True).start()
     threading.Thread(target=charge_guard_loop, daemon=True).start()
+    threading.Thread(target=offgrid_watch_loop, daemon=True).start()
     threading.Thread(target=shelly_loop, daemon=True).start()
     threading.Thread(target=record_server_loop, daemon=True).start()
     threading.Thread(target=record_info_loop, daemon=True).start()
