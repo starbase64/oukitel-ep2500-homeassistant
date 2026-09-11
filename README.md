@@ -143,11 +143,15 @@ therefore show unavailable rows. Two ways out:
   your HA registry. This preserves names, history and statistics:
 
   ```bash
-  cd /home/maik/docker/ep2500
+  cd /path/to/oukitel-ep2500-homeassistant
   python3 tools/fix_dashboard_ids.py \
-    /home/maik/docker/homeassistant \
+    /path/to/homeassistant/config \
     dashboard.yaml dashboard.local.yaml
   ```
+
+  The second argument is the directory holding your `configuration.yaml`; the
+  tool reads `.storage/core.entity_registry` below it. Prefix with `sudo` if
+  that directory belongs to the container user.
 
   Restart the bridge first if the tool reports missing MQTT entities. Then
   paste `dashboard.local.yaml` into the dashboard's raw configuration editor,
