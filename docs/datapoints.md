@@ -97,7 +97,7 @@ even with an empty battery and full sun. See the section on quirks below.
 | 137 | Grid power (mirrors 155) | W | likely |
 | 138 | Grid frequency | ÷100 → Hz | certain |
 | 139 | Grid voltage | ÷10 → V | certain |
-| 149 | System fault register, latched (see note) | – | – | certain |
+| 149 | System fault register, latched (see note) | – | certain |
 | 136 | Grid current | ÷10 → 0.8 A | certain |
 | 141 / 142 | Off-grid socket load, both registers identical | W | certain |
 | 140 | Off-grid output current | ÷10 → 8.7 A | certain |

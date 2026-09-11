@@ -202,6 +202,12 @@ services:
       ECO_SPIKE:    "600"
       LIMIT_MAX:    "800"
       LIMIT_SAFE:   "0"
+      METER_TARGET_MIN: "-2000"
+      METER_TARGET_MAX: "2000"
+      AC_STORAGE1_IP: ""
+      AC_STORAGE2_IP: ""
+      AC_STORAGE_MAX_AGE: "15"
+      AC_STORAGE_NOISE: "5"
       LOG_DPS:      "1"
       TZ:           "Europe/Berlin"
     logging:
@@ -266,10 +272,10 @@ into the battery yields less than 800 W at the output — but it never needs to
 go far beyond that, and the cap keeps a stuck loop from opening the solar side
 wide.
 
-Pass-through does not need the meter, so a meter outage does not end it. The
-state-of-charge check keeps running, and the drop back to zero-export control
-five points below the target still happens; the zero-export branch then finds
-the stale meter reading and falls back to `GRID_FAIL_LIMIT`.
+Pass-through also requires a fresh meter value. On a meter outage the bridge
+ends pass-through, reopens the PV limit and sets the export limit to
+`GRID_FAIL_LIMIT`. This avoids continuing to export blindly from the last
+known command.
 
 While pass-through is active the harvest is capped at `LIMIT_MAX`. That is
 unavoidable on this device: the alternative is letting the battery reach the
@@ -289,7 +295,7 @@ publishes rarely, raise `ECO_SPIKE` or set it to `0` to switch the jump
 detection off – while a jump waits for confirmation the stored value ages, and
 past `GRID_MAX_AGE` (60 s) the controller treats the meter as failed.
 
-## 5.4 Start it
+## 5.3 Start it
 
 ```bash
 docker compose up -d --build
@@ -300,9 +306,9 @@ The log should confirm the MQTT connection, the published discovery configs
 and 83 datapoints read from the device. It then appears in HA under
 Settings → Devices & Services → MQTT. No HA restart needed.
 
-*Note: the bridge logs and entity names are in German, since that is what I
-built it for. Everything is in one file and easy to translate if you prefer
-– the datapoint mapping itself is language-independent.*
+The bridge publishes English entity names. Existing installations upgraded
+from an older German-language release keep their entity IDs; the README
+explains the migration options.
 
 `LOG_DPS=1` logs changes to settings datapoints – useful while exploring,
 optional in normal operation.
@@ -341,8 +347,16 @@ entries shown.
 In the dashboard under Control:
 
 - **Battery charge limit:** 2500 W. See part one – never leave it at 0.
-- **Grid target:** 0 for zero export. To export deliberately, for instance to
-  feed a second storage unit, enter a negative value.
+- **Meter target (+ import / - export):** `0 W` for zero export. A positive
+  value such as `+50 W` deliberately keeps that much grid import. A negative
+  value such as `-300 W` makes the EP2500 increase its output until the meter
+  reports about 300 W export — useful when a second AC-coupled storage unit
+  should charge even though the EP2500 is not yet full. The EP2500 can only
+  move the meter as far as its configured `LIMIT_MAX` and available battery/PV
+  power allow.
+- **AC storage 1/2:** enter the IP addresses of the Shelly plugs in front of
+  the AC-coupled storage units and switch their relays on. Positive Shelly
+  power is treated as charging power. Leave an unused address empty.
 - **Backflow prevention:** off, unless you want to block export entirely.
 - **Control active:** on.
 
@@ -355,16 +369,44 @@ In the dashboard under Control:
 | Deadband | 15–25 W | filters out ineffective small corrections |
 | Max step | 800 W | matches the control range |
 
-On the deadband: every control step writes to the inverter's memory. At a 5 s
-interval that would be 17,000 writes a day in theory. Nobody knows how well the
-firmware handles that long term. A generous deadband is not a loss of accuracy,
-it is caution.
+On the deadband: every effective control step sends another write command to
+the inverter. How the firmware persists these values is undocumented. A
+generous deadband reduces unnecessary traffic without sacrificing useful
+accuracy.
 
 ## 7.3 What you should see
 
 The meter hovers around zero, the feed-in limit follows your consumption, and
 on PV surplus it drops back to 0 so the battery charges. Direction changes and
 faults show up in the event log.
+
+## 7.4 Charging another AC storage without controller ramp-up
+
+A fixed negative grid target alone creates a feedback problem: with a target
+of `-300 W`, the other storage absorbs the first 300 W and the grid meter moves
+back towards zero. A controller that only sees the grid meter then raises the
+EP2500 output again.
+
+The two optional AC-storage Shelly inputs remove that feedback. For a negative
+requested target the bridge uses:
+
+```text
+effective meter target = requested target + measured AC-storage charging power
+```
+
+The measured contribution is clamped to the requested export. With `-300 W`
+requested, 100 W of storage charging produces an effective meter target of
+`-200 W`; at 300 W charging the effective target is `0 W`. The sum of captured
+charging power and remaining grid export therefore stays at 300 W instead of
+ramping indefinitely.
+
+If at least one AC-storage Shelly is configured but no enabled unit has a fresh
+measurement, the bridge temporarily changes a negative target to `0 W`. It
+will not deliberately export blind. The original negative-target behaviour is
+retained when no AC-storage Shelly is configured at all.
+
+Pass-through is suspended while a non-zero meter target is active because its
+fixed-output strategy would otherwise override this controller.
 
 ---
 
@@ -435,9 +477,10 @@ pack keeps draining below it.
 
 ## Switching it off overnight
 
-Three automations and one helper. This belongs in Home Assistant rather than
+Four automations and one helper. This belongs in Home Assistant rather than
 in the bridge — the bridge has no idea where you live or when the sun sets.
-`homeassistant/offgrid_nacht.yaml` holds the same YAML ready to copy.
+`homeassistant/offgrid_nacht.yaml` contains the automations and
+`homeassistant/input_boolean.yaml` contains the helper ready to include.
 
 ### configuration.yaml
 
@@ -482,6 +525,10 @@ and the entity ID will match.
   triggers:
     - trigger: sun
       event: sunrise
+  conditions:
+    - condition: state
+      entity_id: input_boolean.ep2500_offgrid_night_off
+      state: "on"
   actions:
     - action: switch.turn_on
       target:
@@ -498,6 +545,8 @@ and the entity ID will match.
     - trigger: state
       entity_id: input_boolean.ep2500_offgrid_night_off
       to: "on"
+    - trigger: homeassistant
+      event: start
   conditions:
     - condition: state
       entity_id: sun.sun
@@ -506,17 +555,26 @@ and the entity ID will match.
     - action: switch.turn_off
       target:
         entity_id: switch.oukitel_ep2500_off_grid_socket
+
+- id: ep2500_offgrid_helfer_aus
+  alias: EP2500 - restore off-grid socket when night switch is disabled
+  mode: single
+  triggers:
+    - trigger: state
+      entity_id: input_boolean.ep2500_offgrid_night_off
+      to: "off"
+  actions:
+    - action: switch.turn_on
+      target:
+        entity_id: switch.oukitel_ep2500_off_grid_socket
 ```
 
 The syntax above is for Home Assistant 2024.10 and later. On older versions
 use `trigger:`, `condition:` and `action:` in the singular.
 
-Three automations rather than two, for reasons that only show up in use. The
-**sunrise** one has no condition on purpose: switch the helper off during the
-night and the socket should still come back in the morning, not stay dead
-until someone notices. The **third** one covers switching the helper on after
-sunset — without it nothing happens until the next evening, which looks like a
-broken switch.
+The startup trigger also aligns the socket after a Home Assistant restart.
+Disabling the helper restores the socket immediately, while sunrise restores
+it only if automatic night switching is still enabled.
 
 The `logbook.log` entries are optional. They make it easy to line up a
 measurement night with what actually happened.
