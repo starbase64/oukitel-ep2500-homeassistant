@@ -37,12 +37,22 @@ services:
       GRID_FAIL_LIMIT: "0"
       LIMIT_MAX:    "800"
       LIMIT_SAFE:   "0"
+      # Allowed range of "Meter target" in Home Assistant. Positive means
+      # grid import, negative means deliberate grid export.
+      METER_TARGET_MIN: "-2000"
+      METER_TARGET_MAX: "2000"
       CHARGE_HW_MAX: "4000"
       BATT_WH:      "2048"
 
       # --- optional: Shelly plugs for cross-checking ------------------
       SHELLY_IP:    ""
       SHELLY2_IP:   ""
+      # Shelly plugs measuring the input of up to two AC-coupled stores.
+      # These can also be entered later in Home Assistant.
+      AC_STORAGE1_IP: ""
+      AC_STORAGE2_IP: ""
+      AC_STORAGE_MAX_AGE: "15"
+      AC_STORAGE_NOISE: "5"
       # Margin above the discharge stop at which the device releases the
       # off-grid output again. 5 on the unit this was written for.
       OFFGRID_SOC_MARGIN: "5"

@@ -1,7 +1,8 @@
 # Oukitel EP2500 – local control for Home Assistant
 
 Full local integration for the Oukitel EP2500 balcony energy storage system,
-including a zero-export controller. No cloud, no vendor app required.
+including a zero-export controller. After the one-time Tuya provisioning, no
+cloud or vendor app is required for operation.
 
 The EP2500 has **no data model registered in the Tuya cloud**, so no
 off-the-shelf integration works with it. This project documents the local
@@ -12,11 +13,18 @@ Regulation holds the grid connection at ±4 W.
 
 ## What you get
 
-- 35+ sensors: SoC, all four MPPT strings individually, cell voltages,
+- 30+ sensors: SoC, all four MPPT strings individually, cell voltages,
   temperatures, power values, off-grid load, voltage and current
 - Feed-in limit, battery charge limit, PV charge limit and SoC thresholds
   continuously adjustable
 - Zero-export controller with anti-windup and idle detection
+- Configurable meter target: `0 W` for zero export, a positive value for
+  deliberate grid import, or a negative value for deliberate export — for
+  example to make another AC-coupled storage unit charge before the EP2500 is
+  full
+- Two optional Shelly inputs for AC-coupled storage units. Their measured
+  charging power is folded into a negative meter target, preventing the
+  controller from ramping up again as the other storage absorbs the surplus
 - **Pass-through mode**: above a configurable state of charge the controller
   stops regulating against the meter. It pins the export limit at `LIMIT_MAX`
   and trims the PV charge power so the state of charge holds steady, keeping
@@ -103,8 +111,8 @@ Corrections to the datapoint mapping are very welcome, especially for the ones
 still marked unknown. If you own an EP2500 and can confirm or correct something,
 please open an issue.
 
-The bridge logs and entity names are in German. A translation would be a
-welcome contribution.
+The bridge publishes English entity names. Existing installations upgraded
+from an older German-language release keep their entity IDs; see below.
 
 ## License
 

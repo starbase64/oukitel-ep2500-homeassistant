@@ -22,6 +22,7 @@ import logging
 import math
 import signal
 import os
+import queue
 import threading
 import time
 import urllib.request
@@ -74,6 +75,14 @@ SHELLY_INTERVAL = int(os.getenv("SHELLY_INTERVAL", "5"))
 # if you do not have one.
 SHELLY2_IP = os.getenv("SHELLY2_IP", "")
 
+# Optional Shelly plugs in front of up to two AC-coupled storage units. Their
+# charging power is removed from a negative meter target so the EP2500 does
+# not keep increasing its output while the other storage absorbs the surplus.
+AC_STORAGE1_IP = os.getenv("AC_STORAGE1_IP", "")
+AC_STORAGE2_IP = os.getenv("AC_STORAGE2_IP", "")
+AC_STORAGE_MAX_AGE = float(os.getenv("AC_STORAGE_MAX_AGE", "15"))
+AC_STORAGE_NOISE = float(os.getenv("AC_STORAGE_NOISE", "5"))
+
 # Usable capacity for the runtime estimate. Per the type plate,
 # 51.2 V x 40 Ah = 2048 Wh.
 BATT_WH = int(os.getenv("BATT_WH", "2048"))
@@ -90,15 +99,23 @@ GRID_TOPIC = os.getenv("GRID_TOPIC", "ecotracker/power")
 GRID_JSON_KEY = os.getenv("GRID_JSON_KEY", "power")
 GRID_MAX_AGE = 60          # s; older meter readings count as invalid
 
+# Desired power at the grid meter. Positive values deliberately keep a small
+# grid import, negative values deliberately export. The latter is useful when
+# another AC-coupled storage unit should see surplus and start charging.
+METER_TARGET_MIN = int(os.getenv("METER_TARGET_MIN", "-2000"))
+METER_TARGET_MAX = int(os.getenv("METER_TARGET_MAX", "2000"))
+if METER_TARGET_MIN > METER_TARGET_MAX:
+    METER_TARGET_MIN, METER_TARGET_MAX = METER_TARGET_MAX, METER_TARGET_MIN
+
 DP_LIMIT = "121"           # export limit, writable
-DP_CHARGE = "122"          # Netzladeleistung, schreibbar
+DP_CHARGE = "122"          # total battery charge limit, writable
 DP_AC_OUT = "155"          # actual AC output power
 DP_BATT = "128"            # battery power, positive = charging
 DP_OFFGRID = "119"         # off-grid socket on/off, writable
 DP_BACKFLOW = "118"        # backflow prevention: True = no export
 DP_SOC_MAX = "123"         # charge-stop SoC in %
 DP_SOC_MIN = "124"         # discharge-stop SoC in %
-DP_PV_LIMIT = "156"        # PV-Ladeleistung, schreibbar
+DP_PV_LIMIT = "156"        # PV charge limit, writable
 
 LIMIT_MIN = 0
 LIMIT_MAX = int(os.getenv("LIMIT_MAX", "800"))   # legal ceiling
@@ -197,6 +214,8 @@ VERIFY_DELAY = 6           # s before a switch command is read back
 # stop at 15 %, output and control both came back at 20 %.
 OFFGRID_SOC_MARGIN = int(os.getenv("OFFGRID_SOC_MARGIN", "5"))
 HEARTBEAT = 9              # s
+TUYA_RECEIVE_TIMEOUT = float(os.getenv("TUYA_RECEIVE_TIMEOUT", "1"))
+TUYA_COMMAND_TIMEOUT = float(os.getenv("TUYA_COMMAND_TIMEOUT", "12"))
 
 # Log changes to individual datapoints. To identify unknown DPs: set
 # LOG_DPS=1, change a setting in the app, and check the log for which
@@ -600,6 +619,7 @@ class State:
         self.pass_active = False   # pass-through running right now?
         self.pass_pv_setpoint = 0      # W; trimmed PV charge power
         self.pass_next = 0.0       # time of the next trim step
+        self.pass_pv_pending = False  # initial DP 156 write still pending?
         self.pv_reopen = False     # PV limit still to reopen after pass-through?
         self.grid_fail = False     # meter failure already handled?
         self.setpoint = 0.0            # internal setpoint: >0 export, <0 charge
@@ -615,6 +635,17 @@ class State:
         self.shelly2_power = None
         self.shelly2_on = None
         self.shelly2_fails = 0
+        self.ac_storage1_ip = AC_STORAGE1_IP
+        self.ac_storage1_power = None
+        self.ac_storage1_on = None
+        self.ac_storage1_ts = 0.0
+        self.ac_storage1_fails = 0
+        self.ac_storage2_ip = AC_STORAGE2_IP
+        self.ac_storage2_power = None
+        self.ac_storage2_on = None
+        self.ac_storage2_ts = 0.0
+        self.ac_storage2_fails = 0
+        self.ac_storage_wait = False
 
     def tune_get(self, key):
         """Reads a controller parameter under the lock."""
@@ -706,11 +737,11 @@ def publish_discovery(client):
 
     # Meter target: aim for this instead of 0
     client.publish(f"{DISC}/number/ep2500/correction/config", json.dumps({
-        "name": "Meter target",
+        "name": "Meter target (+ import / - export)",
         "unique_id": "ep2500_correction",
         "state_topic": f"{BASE}/correction/state",
         "command_topic": f"{BASE}/correction/set",
-        "min": -2000, "max": 2000, "step": 10,
+        "min": METER_TARGET_MIN, "max": METER_TARGET_MAX, "step": 10,
         "unit_of_measurement": "W",
         "mode": "box",
         "availability_topic": f"{BASE}/available",
@@ -859,6 +890,61 @@ def publish_discovery(client):
         "availability_topic": f"{BASE}/available",
         "device": DEVICE_INFO,
     }), retain=True)
+
+    # Shelly plugs measuring AC-coupled storage charging power. Their relay
+    # switches remain directly controllable from Home Assistant.
+    for nr in (1, 2):
+        key = f"ac_storage{nr}"
+        label = f"AC storage {nr}"
+        client.publish(f"{DISC}/sensor/ep2500/{key}/config", json.dumps({
+            "name": f"{label} charging power",
+            "unique_id": f"ep2500_{key}_power",
+            "state_topic": f"{BASE}/{key}",
+            "value_template": "{{ value_json.power }}",
+            "unit_of_measurement": "W",
+            "device_class": "power",
+            "state_class": "measurement",
+            "icon": "mdi:battery-charging",
+            "availability_topic": f"{BASE}/available",
+            "device": DEVICE_INFO,
+        }), retain=True)
+        client.publish(f"{DISC}/switch/ep2500/{key}/config", json.dumps({
+            "name": label,
+            "unique_id": f"ep2500_{key}_switch",
+            "state_topic": f"{BASE}/{key}",
+            "value_template": "{{ value_json.state }}",
+            "command_topic": f"{BASE}/{key}/set",
+            "payload_on": "ON", "payload_off": "OFF",
+            "icon": "mdi:battery-arrow-up",
+            "availability_topic": f"{BASE}/available",
+            "device": DEVICE_INFO,
+        }), retain=True)
+        client.publish(f"{DISC}/text/ep2500/{key}_ip/config", json.dumps({
+            "name": f"{label} Shelly IP",
+            "unique_id": f"ep2500_{key}_ip",
+            "state_topic": f"{BASE}/{key}_ip",
+            "command_topic": f"{BASE}/{key}_ip/set",
+            "max": 15,
+            "icon": "mdi:ip-network",
+            "entity_category": "config",
+            "availability_topic": f"{BASE}/available",
+            "device": DEVICE_INFO,
+        }), retain=True)
+
+    for key, name in (
+            ("ac_storage_charge_power", "AC storage charging power total"),
+            ("meter_target_effective", "Effective meter target")):
+        client.publish(f"{DISC}/sensor/ep2500/{key}/config", json.dumps({
+            "name": name,
+            "unique_id": f"ep2500_{key}",
+            "state_topic": f"{BASE}/state",
+            "value_template": "{{ value_json." + key + " }}",
+            "unit_of_measurement": "W",
+            "device_class": "power",
+            "state_class": "measurement",
+            "availability_topic": f"{BASE}/available",
+            "device": DEVICE_INFO,
+        }), retain=True)
 
     # The device's own SoC limits
     for key, dp, name, icon in (
@@ -1021,6 +1107,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
               f"{BASE}/socmax/set", f"{BASE}/socmin/set",
               f"{BASE}/shelly_ip/set", f"{BASE}/shelly/set",
               f"{BASE}/shelly2_ip/set", f"{BASE}/shelly2/set",
+              f"{BASE}/ac_storage1_ip/set", f"{BASE}/ac_storage1/set",
+              f"{BASE}/ac_storage2_ip/set", f"{BASE}/ac_storage2/set",
               f"{BASE}/offgrid/set", f"{BASE}/record/set"):
         client.subscribe(t)
     if GRID_SOURCE == "mqtt":
@@ -1036,6 +1124,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{BASE}/passthrough/state")
     client.subscribe(f"{BASE}/shelly_ip")
     client.subscribe(f"{BASE}/shelly2_ip")
+    client.subscribe(f"{BASE}/ac_storage1_ip")
+    client.subscribe(f"{BASE}/ac_storage2_ip")
 
     # Re-send the availability state after on MQTT reconnect, otherwise HA
     # shows the entities as permanently unavailable.
@@ -1057,6 +1147,10 @@ def publish_settings():
         mqttc.publish(f"{BASE}/shelly_ip", st.shelly_ip, retain=True)
     if "shelly2_ip" not in st.restored and st.shelly2_ip:
         mqttc.publish(f"{BASE}/shelly2_ip", st.shelly2_ip, retain=True)
+    for key in ("ac_storage1", "ac_storage2"):
+        ip = getattr(st, f"{key}_ip")
+        if f"{key}_ip" not in st.restored and ip:
+            mqttc.publish(f"{BASE}/{key}_ip", ip, retain=True)
     if "passthrough" not in st.restored:
         mqttc.publish(f"{BASE}/passthrough/state",
                       "ON" if st.pass_on else "OFF", retain=True)
@@ -1068,8 +1162,11 @@ def publish_settings():
     log.info("Controller parameters: %s", st.tune)
     # When reading logs it helps to see which addresses actually arrived - on
     # environment variable that never made it is otherwise easy to miss.
-    log.info("Shelly addresses: mains disconnect=%r  north PV=%r",
-             st.shelly_ip or "(empty)", st.shelly2_ip or "(empty)")
+    log.info("Shelly addresses: mains disconnect=%r  north PV=%r  "
+             "AC storage 1=%r  AC storage 2=%r",
+             st.shelly_ip or "(empty)", st.shelly2_ip or "(empty)",
+             st.ac_storage1_ip or "(empty)",
+             st.ac_storage2_ip or "(empty)")
 
 
 def on_message(client, userdata, msg):
@@ -1119,6 +1216,29 @@ def on_message(client, userdata, msg):
             log.info("Shelly address %s (restored)", payload)
         return
 
+    for nr in (1, 2):
+        key = f"ac_storage{nr}"
+        if topic == f"{BASE}/{key}/set":
+            shelly_switch(payload.upper() == "ON", nr=nr + 2)
+            return
+        if topic == f"{BASE}/{key}_ip/set":
+            ip = payload.strip()
+            setattr(st, f"{key}_ip", ip)
+            setattr(st, f"{key}_fails", 0)
+            setattr(st, f"{key}_power", None)
+            setattr(st, f"{key}_ts", 0.0)
+            st.restored.add(f"{key}_ip")
+            client.publish(f"{BASE}/{key}_ip", ip, retain=True)
+            event(f"AC storage {nr} Shelly address changed to {ip or '(empty)'}")
+            return
+        if topic == f"{BASE}/{key}_ip":
+            if f"{key}_ip" not in st.restored and payload:
+                setattr(st, f"{key}_ip", payload)
+                st.restored.add(f"{key}_ip")
+                log.info("AC storage %s Shelly address %s (restored)",
+                         nr, payload)
+            return
+
     if topic == f"{BASE}/shelly2/set":
         shelly_switch(payload.upper() == "ON", nr=2)
         return
@@ -1158,18 +1278,13 @@ def on_message(client, userdata, msg):
             val = parse_number(payload)
             if val is not None:
                 val = max(0, min(100, int(val)))
-                with _dev_lock:
-                    if _dev is not None:
-                        try:
-                            res = _dev.set_value(int(dp), val)
-                            ok, reason_txt = antwort_ok(res)
-                            if ok:
-                                log_changes(st.merge({dp: val}), "(HA)")
-                                event(f"{name} set to {val} %")
-                            else:
-                                log.warning("%s rejected: %s", name, reason_txt)
-                        except Exception as exc:
-                            log.error("Setting %s failed: %s", name, exc)
+                res = tuya_call("set_value", int(dp), val)
+                ok, reason_txt = antwort_ok(res)
+                if ok:
+                    log_changes(st.merge({dp: val}), "(HA)")
+                    event(f"{name} set to {val} %")
+                else:
+                    log.warning("%s rejected: %s", name, reason_txt)
                 publish_state()
             return
 
@@ -1187,6 +1302,10 @@ def on_message(client, userdata, msg):
         client.publish(f"{BASE}/passthrough/state",
                        "ON" if st.pass_on else "OFF", retain=True)
         event("Pass-through " + ("enabled" if st.pass_on else "disabled"))
+        if not st.pass_on and (st.pass_active or st.pass_pv_pending
+                               or st.pv_reopen):
+            stop_passthrough("disabled in Home Assistant",
+                             safe_limit=LIMIT_SAFE)
         return
 
     if topic == f"{BASE}/backflow/set":
@@ -1224,16 +1343,10 @@ def on_message(client, userdata, msg):
 
     if topic == f"{BASE}/offgrid/set":
         on = payload.upper() == "ON"
-        ok, reason_txt = False, "no connection"
-        with _dev_lock:
-            if _dev is not None:
-                try:
-                    res = _dev.set_value(int(DP_OFFGRID), on)
-                    ok, reason_txt = antwort_ok(res)
-                    if ok:
-                        st.merge({DP_OFFGRID: on})
-                except Exception as exc:
-                    reason_txt = str(exc)
+        res = tuya_call("set_value", int(DP_OFFGRID), on)
+        ok, reason_txt = antwort_ok(res)
+        if ok:
+            st.merge({DP_OFFGRID: on})
         if ok:
             event("Off-grid socket "
                   + ("switched on" if on else "switched off"))
@@ -1270,8 +1383,11 @@ def on_message(client, userdata, msg):
         if "correction" not in st.restored:
             val = parse_number(payload)
             if val is not None:
-                st.correction = int(val)
+                st.correction = clamp_meter_target(val)
                 st.restored.add("correction")
+                if st.correction != int(round(val)):
+                    client.publish(f"{BASE}/correction/state", st.correction,
+                                   retain=True)
         return
 
     if topic == GRID_TOPIC:
@@ -1298,15 +1414,18 @@ def on_message(client, userdata, msg):
         client.publish(f"{BASE}/control/state",
                        "ON" if st.control_on else "OFF", retain=True)
         event("Control " + ("switched on" if st.control_on else "switched off"))
+        if not st.control_on:
+            stop_passthrough("control switched off", safe_limit=LIMIT_SAFE)
         return
 
     if topic == f"{BASE}/correction/set":
         val = parse_number(payload)
         if val is not None:
-            st.correction = int(val)
+            st.correction = clamp_meter_target(val)
             st.restored.add("correction")
             client.publish(f"{BASE}/correction/state", st.correction, retain=True)
             log.info("Meter target = %s W", st.correction)
+            event(f"Meter target set to {st.correction:+d} W")
 
 
 def apply_tune(key, payload, source="", echo=True):
@@ -1347,6 +1466,70 @@ def parse_number(payload, json_key=None):
     return None
 
 
+def clamp_meter_target(value):
+    """Clamps and rounds the desired meter power to its configured range."""
+    return max(METER_TARGET_MIN,
+               min(METER_TARGET_MAX, int(round(float(value)))))
+
+
+def calculate_setpoint(grid, target, actual, current, gain, max_step):
+    """Returns the next DP 121 setpoint for a signed meter target."""
+    error = grid - target  # >0: output must rise; <0: output must fall
+    current = min(actual + WINDUP_MARGIN, current)
+    current += max(-max_step, min(max_step, error * gain))
+    return max(0.0, min(float(LIMIT_MAX), current))
+
+
+def compensated_meter_target(requested, storage_power, ready=True,
+                             compensation_enabled=True):
+    """Offsets a negative meter target by AC-storage charging power.
+
+    Example: requested -300 W and 100 W measured charging gives an effective
+    meter target of -200 W. At 300 W charging the effective target is 0 W.
+    The contribution is capped, so it can never turn the request into import
+    or create a positive feedback ramp.
+    """
+    requested = float(requested)
+    if requested >= 0 or not compensation_enabled:
+        return requested
+    if not ready:
+        return 0.0
+    absorbed = min(-requested, max(0.0, float(storage_power)))
+    return min(0.0, requested + absorbed)
+
+
+def ac_storage_charge_power(now=None):
+    """Returns (watts, ready, configured) for enabled AC-storage Shellys."""
+    now = time.time() if now is None else now
+    total = 0.0
+    configured = False
+    active = False
+    with st.lock:
+        values = [
+            (st.ac_storage1_ip, st.ac_storage1_power,
+             st.ac_storage1_on, st.ac_storage1_ts),
+            (st.ac_storage2_ip, st.ac_storage2_power,
+             st.ac_storage2_on, st.ac_storage2_ts),
+        ]
+
+    for ip, power, on, timestamp in values:
+        if not ip:
+            continue
+        configured = True
+        if on is False:
+            continue
+        active = True
+        if (not isinstance(power, (int, float))
+                or now - timestamp > AC_STORAGE_MAX_AGE):
+            return 0.0, False, True
+        if power > AC_STORAGE_NOISE:
+            total += power
+
+    # If Shellys are configured but all their relays are off, do not create
+    # deliberate grid export that no storage unit can absorb.
+    return total, (not configured or active), configured
+
+
 mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ep2500-bridge")
 if MQTT_USER:
     mqttc.username_pw_set(MQTT_USER, MQTT_PASS)
@@ -1359,18 +1542,66 @@ mqttc.on_message = on_message
 # Tuya
 # --------------------------------------------------------------------------
 
-_dev_lock = threading.Lock()
-_dev = None
+_tuya_requests = queue.Queue()
+
+
+class TuyaRequest:
+    """One command handed to the single thread that owns the Tuya socket."""
+
+    def __init__(self, method, args, timeout):
+        self.method = method
+        self.args = args
+        self.deadline = time.monotonic() + timeout
+        self.done = threading.Event()
+        self.result = None
 
 
 def connect_device():
-    global _dev
     d = tinytuya.OutletDevice(DEVICE_ID, DEVICE_IP, LOCAL_KEY, port=DEVICE_PORT)
     d.set_version(3.5)
     d.set_socketPersistent(True)
-    d.set_socketTimeout(8)
-    _dev = d
+    d.set_socketRetryLimit(1)
+    d.set_socketTimeout(TUYA_COMMAND_TIMEOUT)
     return d
+
+
+def tuya_call(method, *args, timeout=TUYA_COMMAND_TIMEOUT):
+    """Runs a command on the Tuya I/O thread and waits for its reply.
+
+    TinyTuya uses one request/response socket and does not serialize access
+    itself. Sending from MQTT, controller and verification threads in parallel
+    can make one caller consume another caller's reply. All socket operations
+    therefore go through this queue.
+    """
+    if not st.online:
+        return {"Error": "device offline", "Err": "offline"}
+    request = TuyaRequest(method, args, timeout)
+    _tuya_requests.put(request)
+    if not request.done.wait(timeout):
+        return {"Error": "Tuya command timed out", "Err": "timeout"}
+    return request.result
+
+
+def process_tuya_requests(d, maximum=32):
+    """Executes queued commands; called only by ``tuya_loop``."""
+    for _ in range(maximum):
+        try:
+            request = _tuya_requests.get_nowait()
+        except queue.Empty:
+            break
+
+        if time.monotonic() >= request.deadline:
+            request.result = {"Error": "Tuya command expired", "Err": "timeout"}
+            request.done.set()
+            continue
+
+        try:
+            d.set_socketTimeout(TUYA_COMMAND_TIMEOUT)
+            request.result = getattr(d, request.method)(*request.args)
+        except Exception as exc:
+            request.result = {"Error": str(exc), "Err": "exception"}
+        finally:
+            request.done.set()
 
 
 def antwort_ok(res):
@@ -1393,14 +1624,7 @@ def write_dp(dp, watt, vmax, reason=""):
     watt = max(0, min(vmax, int(watt)))
     name = {DP_LIMIT: "Export limit", DP_CHARGE: "Battery charge limit",
             DP_PV_LIMIT: "PV limit"}.get(dp, f"DP {dp}")
-    with _dev_lock:
-        if _dev is None:
-            return False
-        try:
-            res = _dev.set_value(int(dp), watt)
-        except Exception as exc:
-            log.error("Writing %s failed: %s", name, exc)
-            return False
+    res = tuya_call("set_value", int(dp), watt)
 
     ok, reason_txt = antwort_ok(res)
     if not ok:
@@ -1433,6 +1657,8 @@ def publish_record_info():
         text = "no recording"
     i["text"] = text
     i["url"] = f"http://{REC_HOST}:{REC_PORT}/"
+    mqttc.publish(f"{BASE}/record/state",
+                  "ON" if i["active"] else "OFF", retain=True)
     mqttc.publish(f"{BASE}/record/info", json.dumps(i), retain=True)
 
 
@@ -1452,6 +1678,11 @@ def publish_state():
         out["charge"] = dps[DP_CHARGE]
     out["soll"] = int(round(st.setpoint))
     out["passthrough"] = st.pass_active
+    storage_power, storage_ready, storage_configured = ac_storage_charge_power()
+    out["ac_storage_charge_power"] = round(storage_power)
+    out["meter_target"] = st.correction
+    out["meter_target_effective"] = round(compensated_meter_target(
+        st.correction, storage_power, storage_ready, storage_configured))
     error = dps.get("149")
     fault_txt, fault_serious = fault_text(error)
     out["fault"] = error if isinstance(error, int) else 0
@@ -1509,6 +1740,10 @@ def tuya_loop():
             next_full = time.time() + POLL_FULL
 
             while True:
+                process_tuya_requests(d)
+                # Keep receive() short so a command from MQTT or the control
+                # loop does not sit behind an eight-second blocking read.
+                d.set_socketTimeout(TUYA_RECEIVE_TIMEOUT)
                 frame = d.receive()
                 if isinstance(frame, dict):
                     if "dps" in frame:
@@ -1522,11 +1757,13 @@ def tuya_loop():
                     d.heartbeat(nowait=True)
                     next_hb = now + HEARTBEAT
                 if now >= next_full:
-                    with _dev_lock:
-                        full = d.status()
+                    d.set_socketTimeout(TUYA_COMMAND_TIMEOUT)
+                    full = d.status()
                     if isinstance(full, dict) and "dps" in full:
                         log_changes(st.merge(full["dps"]), "(poll)")
                         publish_state()
+                    elif isinstance(full, dict) and "Error" in full:
+                        raise RuntimeError(full["Error"])
                     next_full = now + POLL_FULL
 
         except Exception as exc:
@@ -1677,65 +1914,71 @@ def shelly_switch_raw(ip, on):
         pass
 
 
+def shelly_slot(nr):
+    """Returns the state prefix, label and MQTT topic for one Shelly slot."""
+    slots = {
+        1: ("shelly", "Shelly"),
+        2: ("shelly2", "Shelly north PV"),
+        3: ("ac_storage1", "AC storage 1"),
+        4: ("ac_storage2", "AC storage 2"),
+    }
+    key, name = slots[nr]
+    return key, name, f"{BASE}/{key}"
+
+
 def shelly_poll(nr):
-    """Reads power and relay state of one of the two Shellys."""
-    ip = st.shelly_ip if nr == 1 else st.shelly2_ip
-    name = "Shelly" if nr == 1 else "Shelly north PV"
-    topic = f"{BASE}/shelly" if nr == 1 else f"{BASE}/shelly2"
+    """Reads power and relay state of one configured Shelly."""
+    key, name, topic = shelly_slot(nr)
+    ip = getattr(st, f"{key}_ip")
     if not ip:
         return
     try:
         power, on = shelly_status(ip)
         with st.lock:
-            if nr == 1:
-                st.shelly_power = float(power) if power is not None else None
-                st.shelly_on = bool(on) if on is not None else None
-            else:
-                st.shelly2_power = float(power) if power is not None else None
-                st.shelly2_on = bool(on) if on is not None else None
-        fails = st.shelly_fails if nr == 1 else st.shelly2_fails
+            setattr(st, f"{key}_power",
+                    float(power) if power is not None else None)
+            setattr(st, f"{key}_on", bool(on) if on is not None else None)
+            if hasattr(st, f"{key}_ts") and power is not None:
+                setattr(st, f"{key}_ts", time.time())
+        fails = getattr(st, f"{key}_fails")
         if fails >= 5:
             event(f"{name} reachable again ({ip})", auch_loggen=False)
-        if nr == 1:
-            st.shelly_fails = 0
-        else:
-            st.shelly2_fails = 0
+        setattr(st, f"{key}_fails", 0)
         mqttc.publish(topic, json.dumps({
             "power": round(power) if power is not None else None,
             "state": "ON" if on else "OFF",
             "ip": ip,
         }))
     except Exception as exc:
-        if nr == 1:
-            st.shelly_fails += 1
-            fails = st.shelly_fails
-        else:
-            st.shelly2_fails += 1
-            fails = st.shelly2_fails
+        setattr(st, f"{key}_fails", getattr(st, f"{key}_fails") + 1)
+        fails = getattr(st, f"{key}_fails")
         if fails in (1, 5) or fails % 60 == 0:
             log.warning("%s %s unreachable (%dx): %s", name, ip, fails, exc)
         if fails == 5:
             event(f"{name} {ip} is not responding", auch_loggen=False)
 
 
-def shelly_loop():
+def shelly_loop(nr):
+    """Polls one Shelly independently so a failed unit delays no other."""
     while True:
-        shelly_poll(1)
-        shelly_poll(2)
+        shelly_poll(nr)
         time.sleep(SHELLY_INTERVAL)
 
 
 def shelly_switch(on, nr=1):
     """Switches a Shelly. Hard-disconnects that device from mains."""
-    ip = st.shelly_ip if nr == 1 else st.shelly2_ip
-    name = "Shelly" if nr == 1 else "Shelly north PV"
+    key, name, _topic = shelly_slot(nr)
+    ip = getattr(st, f"{key}_ip")
+    if not ip:
+        log.warning("%s has no Shelly IP configured", name)
+        return False
     try:
         shelly_switch_raw(ip, on)
         with st.lock:
-            if nr == 1:
-                st.shelly_on = bool(on)
-            else:
-                st.shelly2_on = bool(on)
+            setattr(st, f"{key}_on", bool(on))
+            if not on and hasattr(st, f"{key}_ts"):
+                setattr(st, f"{key}_power", 0.0)
+                setattr(st, f"{key}_ts", time.time())
         event(f"{name} {'switched on' if on else 'switched off'} ({ip})")
         return True
     except Exception as exc:
@@ -1759,6 +2002,7 @@ def offgrid_watch_loop():
             continue
         dps = st.snapshot()
         if not dps.get(DP_OFFGRID):
+            st.offgrid_reported = False
             continue                      # not enabled, nothing to report
         locked, soc, threshold = offgrid_locked(dps)
         if locked and not st.offgrid_reported:
@@ -1803,6 +2047,27 @@ def set_pv_limit(watt, reason=""):
     return write_dp(DP_PV_LIMIT, watt, 4000, reason)
 
 
+def stop_passthrough(reason, safe_limit=None):
+    """Ends pass-through and restores every limit it may have changed."""
+    was_active = st.pass_active
+    needs_restore = (was_active or st.pass_pv_pending or st.pv_reopen
+                     or st.pass_pv_setpoint > 0)
+    st.pass_active = False
+    st.pass_pv_pending = False
+    st.pass_pv_setpoint = 0
+    st.pass_next = 0.0
+
+    if needs_restore:
+        st.pv_reopen = not set_pv_limit(
+            st.tune["pv_max"], reason=f"pass-through ended: {reason}")
+    if safe_limit is not None:
+        set_limit(safe_limit, reason=reason)
+        st.setpoint = float(safe_limit)
+    if was_active:
+        event(f"Pass-through ended ({reason})")
+    publish_state()
+
+
 def offgrid_locked(dps):
     """Checks whether the state of charge locks out the off-grid output.
 
@@ -1819,15 +2084,9 @@ def offgrid_locked(dps):
 
 def read_device_status():
     """Fetches a full status and merges it. Returns dps, or None."""
-    with _dev_lock:
-        if _dev is None:
-            return None
-        try:
-            data = _dev.status()
-        except Exception as exc:
-            log.warning("Status query failed: %s", exc)
-            return None
+    data = tuya_call("status")
     if not (isinstance(data, dict) and "dps" in data):
+        log.warning("Status query failed: %s", data)
         return None
     log_changes(st.merge(data["dps"]), "(verify)")
     return data["dps"]
@@ -1860,14 +2119,7 @@ def set_backflow(block, source=""):
     entirely and the device goes to standby. It has no effect on charging
     from the grid.
     """
-    with _dev_lock:
-        if _dev is None:
-            return False
-        try:
-            res = _dev.set_value(int(DP_BACKFLOW), bool(block))
-        except Exception as exc:
-            log.error("Switching backflow prevention failed: %s", exc)
-            return False
+    res = tuya_call("set_value", int(DP_BACKFLOW), bool(block))
     ok, reason_txt = antwort_ok(res)
     if not ok:
         log.warning("Backflow prevention rejected: %s", reason_txt)
@@ -1943,6 +2195,44 @@ def control_loop():
         if limit is None:
             continue
 
+        # Every mode that feeds the grid needs a fresh meter value. Keeping
+        # the last export command alive during a meter outage would mean
+        # exporting blind, including while pass-through is active.
+        with st.lock:
+            grid = st.grid
+            grid_age = time.time() - st.grid_ts
+            requested_target = st.correction
+
+        if grid is None or grid_age > GRID_MAX_AGE:
+            if st.pass_active:
+                stop_passthrough("meter failure")
+            if not st.grid_fail:
+                st.grid_fail = True
+                event(f"Meter is not reporting - export limit set to "
+                      f"{GRID_FAIL_LIMIT} W")
+                set_limit(GRID_FAIL_LIMIT, reason="meter failure")
+                st.setpoint = float(GRID_FAIL_LIMIT)
+                publish_state()
+            continue
+        if st.grid_fail:
+            st.grid_fail = False
+            event("Meter is reporting again - control active")
+
+        storage_power, storage_ready, storage_configured = \
+            ac_storage_charge_power()
+        meter_target = compensated_meter_target(
+            requested_target, storage_power, storage_ready,
+            storage_configured)
+        waiting = (requested_target < 0 and storage_configured
+                   and not storage_ready)
+        if waiting and not st.ac_storage_wait:
+            st.ac_storage_wait = True
+            event("Negative meter target paused - no fresh reading from an "
+                  "enabled AC-storage Shelly")
+        elif not waiting and st.ac_storage_wait:
+            st.ac_storage_wait = False
+            event("AC-storage Shelly readings available - negative target active")
+
         # ------------------------------------------------------------------
         # Pass-through
         # ------------------------------------------------------------------
@@ -1958,7 +2248,8 @@ def control_loop():
         # than the rule - hence one small step every few minutes is enough.
         soc = dps.get("102")
         target = st.tune["soc_pass"]
-        if st.pass_on and isinstance(soc, (int, float)):
+        if (st.pass_on and requested_target == 0
+                and isinstance(soc, (int, float))):
             # Hysteresis: once active it stays until PASS_HYST below target
             grenze = target - PASS_HYST if st.pass_active else target
             active = soc >= grenze
@@ -1966,8 +2257,8 @@ def control_loop():
             active = False
 
         if active != st.pass_active:
-            st.pass_active = active
             if active:
+                st.pass_active = True
                 st.pass_next = time.time() + PASS_SETTLE
                 event(f"Pass-through active - holding state of charge at {target} %, "
                       f"{LIMIT_MAX} W into the house")
@@ -1978,17 +2269,15 @@ def control_loop():
                 # otherwise start out holding a value the device never got.
                 if set_pv_limit(LIMIT_MAX, reason="pass-through"):
                     st.pass_pv_setpoint = LIMIT_MAX
+                    st.pass_pv_pending = False
                 else:
+                    st.pass_pv_pending = True
                     st.pass_next = time.time() + PASS_ADJUST_FAST
             else:
-                event("Pass-through ended - back to zero-export control")
-                # Open the PV limit fully again, otherwise the harvest stays
-                # throttled. If that fails it has to be retried - otherwise
-                # the solar side stays curtailed indefinitely without anyone
-                # noticing. Exactly what happened on 09.09. at 14:32.
-                if not set_pv_limit(st.tune["pv_max"],
-                                    reason="pass-through ended"):
-                    st.pv_reopen = True
+                reason = ("signed meter target active"
+                          if requested_target != 0
+                          else "state of charge below threshold")
+                stop_passthrough(reason)
             publish_state()
 
         # Catch up if reopening the PV limit failed when pass-through ended.
@@ -1999,6 +2288,20 @@ def control_loop():
                 publish_state()
 
         if active:
+            # The initial PV-limit write may have failed. Retry it even while
+            # SoC is exactly on target; otherwise the old code could remain in
+            # pass-through forever with no effective PV setting.
+            if st.pass_pv_pending:
+                if set_pv_limit(LIMIT_MAX,
+                                reason="pass-through: initial retry"):
+                    st.pass_pv_setpoint = LIMIT_MAX
+                    st.pass_pv_pending = False
+                    st.pass_next = time.time() + PASS_SETTLE
+                    publish_state()
+                else:
+                    st.pass_next = time.time() + PASS_ADJUST_FAST
+                continue
+
             # The export limit is fixed. If something else moved it (the app,
             # a rejected command), put it back.
             if isinstance(limit, int) and limit != LIMIT_MAX:
@@ -2073,34 +2376,11 @@ def control_loop():
                 st.pass_next = time.time() + PASS_ADJUST_FAST
             continue
 
-        # From here on it is zero-export control only. That needs the meter;
-        # pass-through above does not - which is why it sits before this
-        # check.
-        with st.lock:
-            grid = st.grid
-            grid_age = time.time() - st.grid_ts
-            target = st.correction
-
-        if grid is None or grid_age > GRID_MAX_AGE:
-            if not st.grid_fail:
-                st.grid_fail = True
-                event(f"Meter is not reporting - export limit set to "
-                      f"{GRID_FAIL_LIMIT} W")
-                # Without a meter reading there is nothing to control
-                # against. Simply leaving the last limit in place would mean
-                # exporting blind.
-                set_limit(GRID_FAIL_LIMIT, reason="meter failure")
-                st.setpoint = float(GRID_FAIL_LIMIT)
-                publish_state()
-            continue
-        if st.grid_fail:
-            st.grid_fail = False
-            event("Meter is reporting again - control active")
-
         ac_out = dps.get(DP_AC_OUT)
         status = dps.get("134")
 
         actual = float(ac_out) if isinstance(ac_out, (int, float)) else 0.0
+        target = meter_target
         error = grid - target          # >0 = importing, device must give more
 
         # Idle lock: only when power was actually requested and nothing comes
@@ -2141,24 +2421,28 @@ def control_loop():
         # lower clamp undid the correction that had just been made. Observed:
         # at a meter deviation of -15 W the setpoint jumped from 432 to 720 W
         # because "actual" still read 795 W.
-        setpoint = min(actual + WINDUP_MARGIN, st.setpoint)
-
         max_step = st.tune["max_step"]
-        setpoint += max(-max_step, min(max_step, error * st.tune["gain"]))
-        setpoint = max(0.0, min(float(LIMIT_MAX), setpoint))
+        setpoint = calculate_setpoint(grid, target, actual, st.setpoint,
+                                      st.tune["gain"], max_step)
         st.setpoint = setpoint
 
         new = int(round(setpoint))
         if abs(new - limit) < CTRL_MIN_STEP:
             continue
 
-        log.info("Meter %+.0f W (target %+d) | actual %.0f W | export %s -> %s",
-                 grid, target, actual, limit, new)
+        log.info("Meter %+.0f W (target %+.0f, requested %+d, AC storage %.0f W) "
+                 "| actual %.0f W | export %s -> %s",
+                 grid, target, requested_target, storage_power,
+                 actual, limit, new)
         set_limit(new, reason="control")
         publish_state()
 
 
 def main():
+    if GRID_SOURCE not in {"http", "mqtt"}:
+        log.error("GRID_SOURCE must be 'http' or 'mqtt', not %r.", GRID_SOURCE)
+        raise SystemExit(1)
+
     missing = [n for n, v in (("EP2500_ID", DEVICE_ID),
                               ("EP2500_IP", DEVICE_IP),
                               ("EP2500_KEY", LOCAL_KEY)) if not v]
@@ -2176,7 +2460,8 @@ def main():
     threading.Thread(target=control_loop, daemon=True).start()
     threading.Thread(target=charge_guard_loop, daemon=True).start()
     threading.Thread(target=offgrid_watch_loop, daemon=True).start()
-    threading.Thread(target=shelly_loop, daemon=True).start()
+    for nr in (1, 2, 3, 4):
+        threading.Thread(target=shelly_loop, args=(nr,), daemon=True).start()
     threading.Thread(target=record_server_loop, daemon=True).start()
     threading.Thread(target=record_info_loop, daemon=True).start()
 

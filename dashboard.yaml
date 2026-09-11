@@ -165,12 +165,29 @@ views:
               - entity: text.oukitel_ep2500_north_pv_shelly_ip
                 name: North PV Shelly IP
               - type: divider
+              - entity: switch.oukitel_ep2500_ac_storage_1
+                name: AC storage 1
+              - entity: text.oukitel_ep2500_ac_storage_1_shelly_ip
+                name: AC storage 1 Shelly IP
+              - entity: sensor.oukitel_ep2500_ac_storage_1_charging_power
+                name: '  Charging power'
+              - entity: switch.oukitel_ep2500_ac_storage_2
+                name: AC storage 2
+              - entity: text.oukitel_ep2500_ac_storage_2_shelly_ip
+                name: AC storage 2 Shelly IP
+              - entity: sensor.oukitel_ep2500_ac_storage_2_charging_power
+                name: '  Charging power'
+              - type: divider
               - entity: number.oukitel_ep2500_export_limit
                 name: Export limit
               - entity: number.oukitel_ep2500_battery_charge_limit
                 name: Battery charge limit (PV + grid)
               - entity: number.oukitel_ep2500_meter_target
-                name: Meter target
+                name: Meter target (+ import / - export)
+              - entity: sensor.oukitel_ep2500_effective_meter_target
+                name: Effective meter target
+              - entity: sensor.oukitel_ep2500_ac_storage_charging_power_total
+                name: AC storage charging total
               - type: divider
               - entity: number.oukitel_ep2500_charge_stop
                 name: Charge stop (SoC max)
