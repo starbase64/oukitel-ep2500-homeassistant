@@ -14,8 +14,8 @@
 # Home Assistant refuse to start with a duplicate key error.
 
 input_boolean:
-  ep2500_offgrid_nachtabschaltung:
-    name: EP2500 Off-Grid nachts aus
+  ep2500_offgrid_night_off:
+    name: EP2500 off-grid off at night
     icon: mdi:weather-night
 
 # ===========================================================================
@@ -28,7 +28,7 @@ input_boolean:
 # Developer tools > States and adjust.
 
 - id: ep2500_offgrid_sonnenuntergang
-  alias: EP2500 - Off-Grid-Steckdose bei Sonnenuntergang aus
+  alias: EP2500 - off-grid socket off at sunset
   description: >-
     Saves the inverter's standby draw for an empty socket overnight.
   mode: single
@@ -37,19 +37,19 @@ input_boolean:
       event: sunset
   conditions:
     - condition: state
-      entity_id: input_boolean.ep2500_offgrid_nachtabschaltung
+      entity_id: input_boolean.ep2500_offgrid_night_off
       state: "on"
   actions:
     - action: switch.turn_off
       target:
-        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+        entity_id: switch.oukitel_ep2500_off_grid_socket
     - action: logbook.log
       data:
         name: EP2500
-        message: Off-Grid-Steckdose zum Sonnenuntergang abgeschaltet.
+        message: Off-grid socket switched off at sunset.
 
 - id: ep2500_offgrid_sonnenaufgang
-  alias: EP2500 - Off-Grid-Steckdose bei Sonnenaufgang an
+  alias: EP2500 - off-grid socket on at sunrise
   description: >-
     Deliberately has no condition. If the helper is switched off during the
     night, the socket should still come back in the morning rather than stay
@@ -61,21 +61,21 @@ input_boolean:
   actions:
     - action: switch.turn_on
       target:
-        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+        entity_id: switch.oukitel_ep2500_off_grid_socket
     - action: logbook.log
       data:
         name: EP2500
-        message: Off-Grid-Steckdose zum Sonnenaufgang eingeschaltet.
+        message: Off-grid socket switched on at sunrise.
 
 - id: ep2500_offgrid_sofort
-  alias: EP2500 - Off-Grid-Steckdose beim Umschalten angleichen
+  alias: EP2500 - align off-grid socket when the helper changes
   description: >-
     Without this one, switching the helper on after sunset does nothing until
     the next evening, which looks like a broken switch.
   mode: single
   triggers:
     - trigger: state
-      entity_id: input_boolean.ep2500_offgrid_nachtabschaltung
+      entity_id: input_boolean.ep2500_offgrid_night_off
       to: "on"
   conditions:
     - condition: state
@@ -84,4 +84,4 @@ input_boolean:
   actions:
     - action: switch.turn_off
       target:
-        entity_id: switch.oukitel_ep2500_off_grid_steckdose
+        entity_id: switch.oukitel_ep2500_off_grid_socket
