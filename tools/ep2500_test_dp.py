@@ -15,7 +15,7 @@ Strg+C oder einem Fehler.
 
 WICHTIG:
   - Oukitel-App vorher schliessen (nur eine lokale Verbindung moeglich).
-  - Regelung in der Bridge abschalten, damit sie nicht dazwischenfunkt.
+  - switch the bridge's control off so it does not interfere.
   - Nur DPs anfassen, deren Bedeutung bekannt ist. Netzparameter und
     Laendereinstellung liegen ebenfalls in diesem Bereich.
 """
@@ -31,7 +31,7 @@ LOCAL_KEY = "YOUR_LOCAL_KEY"
 DEVICE_PORT = 6668
 # ----------------------------------------------------------------------
 
-# Datenpunkte, die bei jedem Schritt mit ausgegeben werden
+# Datapoints printed alongside every step
 WATCH = {
     "128": "Akku",
     "155": "AC-Aus",
@@ -68,7 +68,7 @@ def main():
 
     start = snap("vorher")
     if dp not in start:
-        print(f"\nWARNUNG: DP {dp} kam im Status nicht vor. Abbruch.")
+        print(f"\nWARNING: DP {dp} did not appear in the status. Aborting.")
         return
     alt = start[dp]
 
@@ -95,7 +95,7 @@ def main():
                 break
             print(f"   Versuch {versuch + 1}: DP {dp} = {ist}, wiederhole")
         else:
-            print(f"   ACHTUNG: Ruecksetzen nicht bestaetigt. "
+            print(f"   CAUTION: restore not confirmed. "
                   f"DP {dp} manuell auf {alt} pruefen!")
         snap("Ende")
 

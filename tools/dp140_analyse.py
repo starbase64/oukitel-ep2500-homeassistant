@@ -18,7 +18,7 @@ import collections
 import re
 import sys
 
-# Datenpunkte, die beim Uebergang mit ausgegeben werden
+# Datapoints printed at the transition
 FELDER = [
     ("134", "Status"),
     ("119", "OG-Dose"),
