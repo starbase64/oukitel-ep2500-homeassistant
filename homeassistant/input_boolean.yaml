@@ -1,0 +1,5 @@
+# Include with `input_boolean: !include homeassistant/input_boolean.yaml`, or
+# merge this entry into an existing input_boolean block in configuration.yaml.
+ep2500_offgrid_night_off:
+  name: EP2500 off-grid off at night
+  icon: mdi:weather-night

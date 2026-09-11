@@ -3,24 +3,8 @@
 # Copy-paste source. The reasoning, the measurement behind it and the
 # pitfalls are in docs/setup.md, section "The off-grid socket".
 #
-# The two blocks below go into two different files. Do not paste the whole
-# file into one of them.
-
-# ===========================================================================
-# configuration.yaml  --  MERGE this into an existing input_boolean: block
-# ===========================================================================
-# If your configuration.yaml already has an `input_boolean:` key, add only the
-# indented entry below to it. A second `input_boolean:` at the top level makes
-# Home Assistant refuse to start with a duplicate key error.
-
-input_boolean:
-  ep2500_offgrid_night_off:
-    name: EP2500 off-grid off at night
-    icon: mdi:weather-night
-
-# ===========================================================================
-# automations.yaml  --  append these three
-# ===========================================================================
+# Append these automations to automations.yaml. The separate helper is in
+# input_boolean.yaml; include that file from configuration.yaml if needed.
 # Written in the triggers/conditions/actions syntax used by Home Assistant
 # 2024.10 and later. On older versions use trigger/condition/action instead.
 #
@@ -51,13 +35,15 @@ input_boolean:
 - id: ep2500_offgrid_sonnenaufgang
   alias: EP2500 - off-grid socket on at sunrise
   description: >-
-    Deliberately has no condition. If the helper is switched off during the
-    night, the socket should still come back in the morning rather than stay
-    dead unnoticed.
+    Restores the socket in the morning while night switching is enabled.
   mode: single
   triggers:
     - trigger: sun
       event: sunrise
+  conditions:
+    - condition: state
+      entity_id: input_boolean.ep2500_offgrid_night_off
+      state: "on"
   actions:
     - action: switch.turn_on
       target:
@@ -77,11 +63,27 @@ input_boolean:
     - trigger: state
       entity_id: input_boolean.ep2500_offgrid_night_off
       to: "on"
+    - trigger: homeassistant
+      event: start
   conditions:
     - condition: state
       entity_id: sun.sun
       state: below_horizon
   actions:
     - action: switch.turn_off
+      target:
+        entity_id: switch.oukitel_ep2500_off_grid_socket
+
+- id: ep2500_offgrid_helfer_aus
+  alias: EP2500 - restore off-grid socket when night switch is disabled
+  description: >-
+    Prevents the socket from remaining off after disabling the helper at night.
+  mode: single
+  triggers:
+    - trigger: state
+      entity_id: input_boolean.ep2500_offgrid_night_off
+      to: "off"
+  actions:
+    - action: switch.turn_on
       target:
         entity_id: switch.oukitel_ep2500_off_grid_socket
