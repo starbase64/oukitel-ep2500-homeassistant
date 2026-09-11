@@ -1050,9 +1050,12 @@ def publish_settings():
     if "control" not in st.restored:
         mqttc.publish(f"{BASE}/control/state",
                       "ON" if st.control_on else "OFF", retain=True)
-    if "shelly_ip" not in st.restored:
+    # Leere Adressen nicht veroeffentlichen. Eine leere retained Nachricht
+    # loescht den gespeicherten Wert im Broker, und das Textfeld in Home
+    # Assistant zeigt danach "empty value" an, obwohl vorher etwas drinstand.
+    if "shelly_ip" not in st.restored and st.shelly_ip:
         mqttc.publish(f"{BASE}/shelly_ip", st.shelly_ip, retain=True)
-    if "shelly2_ip" not in st.restored:
+    if "shelly2_ip" not in st.restored and st.shelly2_ip:
         mqttc.publish(f"{BASE}/shelly2_ip", st.shelly2_ip, retain=True)
     if "passthrough" not in st.restored:
         mqttc.publish(f"{BASE}/passthrough/state",
@@ -1063,6 +1066,10 @@ def publish_settings():
         if key not in st.restored:
             mqttc.publish(f"{BASE}/tune/{key}", val, retain=True)
     log.info("Regelparameter: %s", st.tune)
+    # Beim Auswerten hilft es zu sehen, welche Adressen wirklich ankamen -
+    # eine nicht uebernommene Umgebungsvariable faellt sonst nicht auf.
+    log.info("Shelly-Adressen: Netztrennung=%r  Nord-BKW=%r",
+             st.shelly_ip or "(leer)", st.shelly2_ip or "(leer)")
 
 
 def on_message(client, userdata, msg):
