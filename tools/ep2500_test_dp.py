@@ -72,11 +72,17 @@ def main():
         return
     alt = start[dp]
 
-    print(f"\n-> setze DP {dp}: {alt} -> {val}")
-    print("   Antwort:", d.set_value(int(dp), val))
-    print()
-
+    changed = False
     try:
+        print(f"\n-> setze DP {dp}: {alt} -> {val}")
+        response = d.set_value(int(dp), val)
+        print("   Antwort:", response)
+        if response is None or (isinstance(response, dict)
+                                and "Error" in response):
+            raise RuntimeError(f"Schreibbefehl abgelehnt: {response}")
+        changed = True
+        print()
+
         vergangen = 0
         while vergangen < dauer:
             time.sleep(10)
@@ -85,19 +91,20 @@ def main():
     except KeyboardInterrupt:
         print("\nAbbruch durch Benutzer.")
     finally:
-        print(f"\n-> setze DP {dp} zurueck auf {alt}")
-        for versuch in range(3):
-            d.set_value(int(dp), alt)
-            time.sleep(5)
-            ist = (d.status() or {}).get("dps", {}).get(dp)
-            if ist == alt:
-                print(f"   bestaetigt: DP {dp} = {ist}")
-                break
-            print(f"   Versuch {versuch + 1}: DP {dp} = {ist}, wiederhole")
-        else:
-            print(f"   CAUTION: restore not confirmed. "
-                  f"DP {dp} manuell auf {alt} pruefen!")
-        snap("Ende")
+        if changed:
+            print(f"\n-> setze DP {dp} zurueck auf {alt}")
+            for versuch in range(3):
+                d.set_value(int(dp), alt)
+                time.sleep(5)
+                ist = (d.status() or {}).get("dps", {}).get(dp)
+                if ist == alt:
+                    print(f"   bestaetigt: DP {dp} = {ist}")
+                    break
+                print(f"   Versuch {versuch + 1}: DP {dp} = {ist}, wiederhole")
+            else:
+                print(f"   CAUTION: restore not confirmed. "
+                      f"DP {dp} manuell auf {alt} pruefen!")
+            snap("Ende")
 
 
 if __name__ == "__main__":
