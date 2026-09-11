@@ -388,11 +388,15 @@ For an installation upgraded from the old German entity names, use the bundled
 registry-aware converter instead of changing dozens of dashboard rows by hand:
 
 ```bash
-cd /home/maik/docker/ep2500
+cd /path/to/oukitel-ep2500-homeassistant
 python3 tools/fix_dashboard_ids.py \
-  /home/maik/docker/homeassistant \
+  /path/to/homeassistant/config \
   dashboard.yaml dashboard.local.yaml
 ```
+
+The second argument is the directory that holds `configuration.yaml` — the
+tool reads `.storage/core.entity_registry` below it. Prefix the command with
+`sudo` if that directory belongs to the container user.
 
 The generated `dashboard.local.yaml` uses the entity IDs that actually exist
 on that HA installation. If MQTT entities are reported missing, restart the
