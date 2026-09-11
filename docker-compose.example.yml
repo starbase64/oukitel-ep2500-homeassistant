@@ -25,7 +25,7 @@ services:
       ECO_URL:      "http://192.168.1.100/status"
       ECO_FIELD:    "power"
       ECO_INTERVAL: "5"
-      ECO_SPIKE:    "1500"
+      ECO_SPIKE:    "600"
       # GRID_TOPIC:    "meter/power"
       # GRID_JSON_KEY: "power"
 
@@ -36,7 +36,7 @@ services:
       # responding. 0 stops export entirely.
       GRID_FAIL_LIMIT: "0"
       LIMIT_MAX:    "800"
-      LIMIT_SAFE:   "300"
+      LIMIT_SAFE:   "0"
       CHARGE_HW_MAX: "4000"
       BATT_WH:      "2048"
 
@@ -49,6 +49,23 @@ services:
       # 0 = off, 1 = settings changes only, 2 = everything
       LOG_DPS:      "1"
       TZ:           "Europe/Berlin"
+
+      # --- recordings -------------------------------------------------
+      # The "Protokoll aufzeichnen" switch writes the log to a file that
+      # you can download from the bridge itself. REC_HOST is only used to
+      # build the link shown on the dashboard - put the address of this
+      # machine here, otherwise the link points nowhere.
+      REC_HOST:     "192.168.1.20"
+      REC_PORT:     "8099"
+      REC_MAX_MB:   "50"
+      REC_KEEP:     "10"
+
+    ports:
+      - "8099:8099"
+
+    volumes:
+      # Recordings survive a container rebuild only if they live outside it.
+      - ./recordings:/data/recordings
 
     logging:
       driver: json-file

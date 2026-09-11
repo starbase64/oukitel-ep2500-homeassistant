@@ -21,6 +21,16 @@ Regulation holds the grid connection at ±4 W.
   stops regulating against the meter. It pins the export limit at `LIMIT_MAX`
   and trims the PV charge power so the state of charge holds steady, keeping
   the device away from the charge stop where it would shut the solar side down
+- **System fault sensor**: DP 149 is decoded and surfaced in Home Assistant.
+  The register latches — it survives until the device is restarted, so without
+  a sensor a fault sits there unnoticed for days
+- Optional Home Assistant automation that switches the off-grid socket off
+  overnight. The device keeps the socket energised at idle, and standby draw
+  measured out at roughly 38 W — see "The off-grid socket" in
+  [docs/setup.md](docs/setup.md), YAML in `homeassistant/offgrid_nacht.yaml`
+- **Log recording from the dashboard**: a switch starts mirroring the bridge's
+  log into a file, and the bridge serves the recordings over HTTP so you can
+  download them without shell access
 - Estimated remaining runtime
 - Controller parameters adjustable from the dashboard, no restart needed
 - Event log covering the last 48 hours

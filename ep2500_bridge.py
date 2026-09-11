@@ -24,6 +24,10 @@ import os
 import threading
 import time
 import urllib.request
+import http.server
+import socketserver
+import re
+import shutil
 
 import paho.mqtt.client as mqtt
 import tinytuya
@@ -151,6 +155,12 @@ PASS_ADJUST = 180          # s zwischen zwei Nachfuehrschritten
 PASS_ADJUST_FAST = 45      # s im Alarmbereich
 PASS_ALARM = 3             # %-Punkte ueber Ziel = Alarmbereich
 PASS_SETTLE = 120          # s Ruhe nach dem Start, bevor nachgefuehrt wird
+
+# Mindestdauer, die das Geraet den Standby verlassen haben muss, bevor die
+# Regelung wieder anlaeuft. Bei leerem Akku und schwacher Sonne kippt der
+# EP2500 im Sekundentakt hin und her - am 10.09. neunmal in 46 Minuten. Ohne
+# Entprellung besteht das Ereignisprotokoll nur noch aus diesen Wechseln.
+IDLE_HOLD = 180            # s
 PASS_BATT_BIAS = 50        # W je %-Punkt Abweichung, Zielwert fuers Gate
 PASS_PV_CAP = 2 * LIMIT_MAX  # W; hoeher braucht die Durchleitung nie
 
@@ -294,6 +304,210 @@ logging.basicConfig(
 )
 log = logging.getLogger("ep2500")
 
+
+# --------------------------------------------------------------------------
+# Aufzeichnung
+# --------------------------------------------------------------------------
+# Per Schalter im Dashboard laesst sich alles, was die Bridge protokolliert,
+# zusaetzlich in eine Datei schreiben. Zum Herunterladen bringt die Bridge
+# einen kleinen HTTP-Server mit - das ist unabhaengig davon, ob Home
+# Assistant auf demselben Rechner laeuft, und braucht kein gemeinsames
+# Verzeichnis.
+REC_DIR = os.getenv("REC_DIR", "/data/recordings")
+REC_PORT = int(os.getenv("REC_PORT", "8099"))
+REC_MAX_MB = int(os.getenv("REC_MAX_MB", "50"))   # je Datei
+REC_KEEP = int(os.getenv("REC_KEEP", "10"))       # aeltere Dateien loeschen
+# Adresse, unter der die Bridge aus dem Heimnetz erreichbar ist. Nur fuer
+# den Link im Dashboard - der Server selbst lauscht auf allen Adressen.
+REC_HOST = os.getenv("REC_HOST", "")
+
+
+class RecordHandler(logging.Handler):
+    """Schreibt Log-Zeilen in eine Datei, solange die Aufzeichnung laeuft.
+
+    Die Datei wird bei jeder Zeile geleert geschrieben (flush), damit ein
+    Herunterladen waehrend der Aufzeichnung den aktuellen Stand liefert und
+    ein Absturz nichts verschluckt.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.lock_datei = threading.Lock()
+        self.datei = None
+        self.name_datei = None
+        self.zeilen = 0
+        self.start = None
+
+    def emit(self, record):
+        with self.lock_datei:
+            if self.datei is None:
+                return
+            try:
+                self.datei.write(self.format(record) + "\n")
+                self.datei.flush()
+                self.zeilen += 1
+                if self.zeilen % 500 == 0 and self._zu_gross():
+                    self._stop_intern("Groessengrenze erreicht")
+            except Exception:
+                pass          # Eine kaputte Aufzeichnung darf nie die Regelung stoeren
+
+    def _zu_gross(self):
+        try:
+            return self.datei.tell() > REC_MAX_MB * 1024 * 1024
+        except Exception:
+            return False
+
+    def _stop_intern(self, grund=""):
+        if self.datei is not None:
+            try:
+                self.datei.close()
+            except Exception:
+                pass
+        self.datei = None
+
+    def starten(self):
+        """Beginnt eine neue Aufzeichnung. Rueckgabe: Dateiname oder None."""
+        with self.lock_datei:
+            if self.datei is not None:
+                return self.name_datei
+            try:
+                os.makedirs(REC_DIR, exist_ok=True)
+                name = time.strftime("ep2500_%Y%m%d_%H%M%S.log")
+                self.datei = open(os.path.join(REC_DIR, name), "w",
+                                  encoding="utf-8")
+                self.name_datei = name
+                self.zeilen = 0
+                self.start = time.time()
+            except Exception as exc:
+                log.error("Aufzeichnung konnte nicht starten: %s", exc)
+                self.datei = None
+                return None
+        aufraeumen()
+        return self.name_datei
+
+    def stoppen(self):
+        with self.lock_datei:
+            self._stop_intern()
+            return self.name_datei
+
+    def laeuft(self):
+        return self.datei is not None
+
+    def info(self):
+        with self.lock_datei:
+            groesse = 0
+            if self.datei is not None:
+                try:
+                    groesse = self.datei.tell()
+                except Exception:
+                    pass
+            return {
+                "aktiv": self.datei is not None,
+                "datei": self.name_datei,
+                "zeilen": self.zeilen,
+                "kb": round(groesse / 1024, 1),
+                "dauer_min": (round((time.time() - self.start) / 60, 1)
+                              if self.start and self.datei is not None else None),
+            }
+
+
+recorder = RecordHandler()
+recorder.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"))
+logging.getLogger().addHandler(recorder)
+
+
+def aufraeumen():
+    """Loescht alte Aufzeichnungen, damit die Platte nicht volllaeuft."""
+    try:
+        dateien = sorted(f for f in os.listdir(REC_DIR)
+                         if f.startswith("ep2500_") and f.endswith(".log"))
+        for f in dateien[:-REC_KEEP]:
+            os.remove(os.path.join(REC_DIR, f))
+            log.info("Alte Aufzeichnung geloescht: %s", f)
+    except Exception as exc:
+        log.warning("Aufraeumen fehlgeschlagen: %s", exc)
+
+
+class RecordServer(http.server.BaseHTTPRequestHandler):
+    """Listet die Aufzeichnungen und gibt sie zum Herunterladen frei."""
+
+    def log_message(self, *args):
+        pass              # nicht ins eigene Log schreiben, das gaebe eine Schleife
+
+    def do_GET(self):
+        pfad = self.path.split("?")[0]
+        if pfad in ("/", "/index.html"):
+            return self._index()
+        name = pfad.lstrip("/")
+        # Nur exakt die eigenen Dateinamen zulassen - kein ../ und kein
+        # beliebiger Pfad. Der Server laeuft ohne Anmeldung im Heimnetz.
+        if not re.fullmatch(r"ep2500_\d{8}_\d{6}\.log", name):
+            self.send_error(404)
+            return
+        voll = os.path.join(REC_DIR, name)
+        if not os.path.isfile(voll):
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(os.path.getsize(voll)))
+        self.end_headers()
+        with open(voll, "rb") as fh:
+            shutil.copyfileobj(fh, self.wfile)
+
+    def _index(self):
+        try:
+            dateien = sorted((f for f in os.listdir(REC_DIR)
+                              if f.startswith("ep2500_") and f.endswith(".log")),
+                             reverse=True)
+        except Exception:
+            dateien = []
+        zeilen = ["<!doctype html><meta charset='utf-8'>",
+                  "<title>EP2500 Aufzeichnungen</title>",
+                  "<h1>EP2500 Aufzeichnungen</h1>"]
+        if not dateien:
+            zeilen.append("<p>Noch keine Aufzeichnung vorhanden.</p>")
+        else:
+            zeilen.append("<ul>")
+            for f in dateien:
+                kb = os.path.getsize(os.path.join(REC_DIR, f)) / 1024
+                aktiv = " (laeuft)" if f == recorder.name_datei and recorder.laeuft() else ""
+                zeilen.append(f"<li><a href='/{f}'>{f}</a> &ndash; "
+                              f"{kb:.0f} kB{aktiv}</li>")
+            zeilen.append("</ul>")
+        body = "\n".join(zeilen).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class LeiserServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def record_info_loop():
+    """Haelt die Statusanzeige der Aufzeichnung aktuell."""
+    while True:
+        time.sleep(30)
+        try:
+            publish_record_info()
+        except Exception:
+            pass
+
+
+def record_server_loop():
+    try:
+        with LeiserServer(("", REC_PORT), RecordServer) as srv:
+            log.info("Aufzeichnungen abrufbar auf Port %s", REC_PORT)
+            srv.serve_forever()
+    except Exception as exc:
+        log.error("Aufzeichnungsserver nicht gestartet: %s", exc)
+
 # --------------------------------------------------------------------------
 # Entitaeten fuer die HA-Discovery
 # --------------------------------------------------------------------------
@@ -366,6 +580,7 @@ class State:
         self.tune = dict(TUNE_DEFAULTS)
         self.restored = set()      # welche Werte kamen schon aus MQTT zurueck
         self.idle_logged = False   # Leerlauf-Sperre bereits gemeldet?
+        self.idle_since = 0.0      # zuletzt im Leerlauf gesehen
         self.fehler_gemeldet = None  # zuletzt als Ereignis gemeldeter DP 149
         self.pass_on = False       # Durchleitung freigegeben?
         self.pass_aktiv = False    # Durchleitung laeuft gerade?
@@ -716,6 +931,31 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
+    # Aufzeichnung: Schalter und Statusanzeige
+    client.publish(f"{DISC}/switch/ep2500/record/config", json.dumps({
+        "name": "Protokoll aufzeichnen",
+        "unique_id": "ep2500_record",
+        "state_topic": f"{BASE}/record/state",
+        "command_topic": f"{BASE}/record/set",
+        "payload_on": "ON", "payload_off": "OFF",
+        "icon": "mdi:record-rec",
+        "entity_category": "config",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    client.publish(f"{DISC}/sensor/ep2500/record_info/config", json.dumps({
+        "name": "Aufzeichnung",
+        "unique_id": "ep2500_record_info",
+        "state_topic": f"{BASE}/record/info",
+        "value_template": "{{ value_json.text }}",
+        "json_attributes_topic": f"{BASE}/record/info",
+        "icon": "mdi:file-document-outline",
+        "entity_category": "diagnostic",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
     # Ereignisprotokoll der letzten 48 Stunden
     client.publish(f"{DISC}/sensor/ep2500/events/config", json.dumps({
         "name": "Ereignisse",
@@ -767,7 +1007,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
               f"{BASE}/socmax/set", f"{BASE}/socmin/set",
               f"{BASE}/shelly_ip/set", f"{BASE}/shelly/set",
               f"{BASE}/shelly2_ip/set", f"{BASE}/shelly2/set",
-              f"{BASE}/offgrid/set"):
+              f"{BASE}/offgrid/set", f"{BASE}/record/set"):
         client.subscribe(t)
     if GRID_SOURCE == "mqtt":
         client.subscribe(GRID_TOPIC)
@@ -920,6 +1160,26 @@ def on_message(client, userdata, msg):
               + ("eingeschaltet - Einspeisung gesperrt" if sperren
                  else "ausgeschaltet - Einspeisung moeglich"))
         publish_state()
+        return
+
+    if topic == f"{BASE}/record/set":
+        an = payload.upper() == "ON"
+        if an:
+            name = recorder.starten()
+            if name:
+                event(f"Aufzeichnung gestartet: {name}")
+            else:
+                # Anlaufen fehlgeschlagen - den Schalter nicht auf EIN stehen
+                # lassen, sonst zeigt das Dashboard eine Aufzeichnung an, die
+                # es nicht gibt.
+                event("Aufzeichnung konnte nicht gestartet werden")
+                an = False
+        else:
+            name = recorder.stoppen()
+            if name:
+                event(f"Aufzeichnung beendet: {name}")
+        client.publish(f"{BASE}/record/state", "ON" if an else "OFF", retain=True)
+        publish_record_info()
         return
 
     if topic == f"{BASE}/offgrid/set":
@@ -1104,6 +1364,21 @@ def set_limit(watt, reason=""):
 
 def set_charge(watt, reason=""):
     return write_dp(DP_CHARGE, watt, CHARGE_HW_MAX, reason)
+
+
+def publish_record_info():
+    """Veroeffentlicht den Zustand der Aufzeichnung fuer das Dashboard."""
+    i = recorder.info()
+    if i["aktiv"]:
+        text = (f"laeuft seit {i['dauer_min']} min - {i['zeilen']} Zeilen, "
+                f"{i['kb']} kB")
+    elif i["datei"]:
+        text = f"beendet: {i['datei']}"
+    else:
+        text = "keine Aufzeichnung"
+    i["text"] = text
+    i["url"] = f"http://{REC_HOST}:{REC_PORT}/"
+    mqttc.publish(f"{BASE}/record/info", json.dumps(i), retain=True)
 
 
 def publish_state():
@@ -1710,8 +1985,15 @@ def control_loop():
                 event("Regelung pausiert - Geraet im Standby, "
                       f"Akku {dps.get('102', '?')} %")
                 st.idle_logged = True
+            st.idle_since = time.time()
             continue
         if st.idle_logged:
+            # Erst wieder anlaufen, wenn das Geraet IDLE_HOLD am Stueck
+            # ausserhalb des Standby war. Ein kurzes Aufblitzen reicht nicht -
+            # sonst wechselt die Regelung im Minutentakt zwischen pausiert
+            # und aktiv und schreibt das Ereignisprotokoll voll.
+            if time.time() - st.idle_since < IDLE_HOLD:
+                continue
             event("Regelung wieder aktiv - Geraet reagiert")
             st.idle_logged = False
 
@@ -1765,6 +2047,8 @@ def main():
     threading.Thread(target=control_loop, daemon=True).start()
     threading.Thread(target=charge_guard_loop, daemon=True).start()
     threading.Thread(target=shelly_loop, daemon=True).start()
+    threading.Thread(target=record_server_loop, daemon=True).start()
+    threading.Thread(target=record_info_loop, daemon=True).start()
 
     if GRID_SOURCE == "http":
         log.info("Zaehlerquelle: HTTP %s (Feld %s)", ECO_URL, ECO_FIELD)
