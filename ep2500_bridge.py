@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-EP2500 <-> MQTT Bridge mit Home-Assistant-Discovery und Nulleinspeisungs-Regler.
+EP2500 <-> MQTT bridge with Home Assistant discovery and a zero-export
+controller.
 
-Aufgaben:
-  1. Persistente lokale Tuya-Verbindung zum Oukitel EP2500 (Protokoll 3.5).
-     Das Geraet sendet nach dem ersten Vollstatus nur noch Delta-Frames,
-     deshalb wird ein Cache gefuehrt und jedes Frame hineingemergt.
-  2. Veroeffentlichung aller relevanten Werte per MQTT mit HA-Discovery.
-  3. Regelkreis: fuehrt DP 121 (Einspeisegrenze) so nach, dass der
-     Zaehlerwert vom Eco Tracker gegen den Korrekturwert laeuft.
+What it does:
+  1. Holds a persistent local Tuya connection to the Oukitel EP2500
+     (protocol 3.5). After the first full status the device only sends delta
+     frames, so a cache is kept and every frame is merged into it.
+  2. Publishes everything relevant over MQTT with HA discovery.
+  3. Control loop: trims DP 121 (export limit) so the Eco Tracker meter
+     reading moves towards the configured target.
 
-Konfiguration ueber Umgebungsvariablen, Defaults siehe unten.
+Configured through environment variables; defaults below.
 
-Abhaengigkeiten:  pip install tinytuya paho-mqtt
+Dependencies:  pip install tinytuya paho-mqtt
 """
 
 import datetime
@@ -33,7 +34,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 # --------------------------------------------------------------------------
-# Konfiguration
+# Configuration
 # --------------------------------------------------------------------------
 
 DEVICE_ID = os.getenv("EP2500_ID", "")
@@ -49,81 +50,80 @@ MQTT_PASS = os.getenv("MQTT_PASS", "")
 BASE = "ep2500"
 DISC = "homeassistant"
 
-# Zaehlerwert (positiv = Netzbezug, negativ = Einspeisung).
-# GRID_SOURCE "http"  -> Eco Tracker wird direkt abgefragt (Standard)
-# GRID_SOURCE "mqtt"  -> Wert kommt von GRID_TOPIC
+# Meter reading (positive = importing, negative = exporting).
+# GRID_SOURCE "http"  -> poll the Eco Tracker directly (default)
+# GRID_SOURCE "mqtt"  -> take the value from GRID_TOPIC
 GRID_SOURCE = os.getenv("GRID_SOURCE", "http").lower()
 
 ECO_URL = os.getenv("ECO_URL", "http://192.168.1.100/status")
 ECO_FIELD = os.getenv("ECO_FIELD", "power")        # oder "powerAvg"
 ECO_INTERVAL = int(os.getenv("ECO_INTERVAL", "5"))  # s
 
-# Plausibilitaetspruefung: Ein Sprung groesser als ECO_SPIKE Watt gegenueber
-# dem letzten Wert wird erst uebernommen, wenn die naechste Messung ihn
-# bestaetigt. Das faengt einzelne Ausreisser ab, die den Regler sonst auf
-# Anschlag jagen wuerden. 0 schaltet die Pruefung ab.
+# Plausibility check: a jump larger than ECO_SPIKE watts against the previous
+# reading is only accepted once the next reading confirms it. That catches
+# single outliers which would otherwise drive the controller to its limit.
+# 0 turns the check off.
 ECO_SPIKE = int(os.getenv("ECO_SPIKE", "600"))
 
-# Messender Shelly vor dem Geraet - unabhaengige Kontrolle der
-# tatsaechlichen AC-Leistung und harter Ein/Aus-Schalter.
+# Metering Shelly in front of the device - on independent check on the actual
+# AC power, and a hard on/off switch.
 SHELLY_IP = os.getenv("SHELLY_IP", "")
 SHELLY_INTERVAL = int(os.getenv("SHELLY_INTERVAL", "5"))
 
-# Zweiter Shelly, z. B. am Nord-Balkonkraftwerk. Leer lassen, wenn
-# nicht vorhanden.
+# Second Shelly, for example on a north-facing balcony PV system. Leave empty
+# if you do not have one.
 SHELLY2_IP = os.getenv("SHELLY2_IP", "")
 
-# Nutzbare Kapazitaet fuer die Laufzeitschaetzung. Laut Typenschild
-# 51,2 V x 40 Ah = 2048 Wh.
+# Usable capacity for the runtime estimate. Per the type plate,
+# 51.2 V x 40 Ah = 2048 Wh.
 BATT_WH = int(os.getenv("BATT_WH", "2048"))
 
-# Messender Shelly vor dem Geraet, dient als unabhaengige Gegenprobe zur
-# AC-Ausgangsleistung des EP2500. Die Adresse ist in HA aenderbar.
+# Metering Shelly in front of the device, used as on independent cross-check
+# against the EP2500's AC output power. The address is editable from HA.
 
-# Zweiter Shelly, z. B. am Nord-Balkonkraftwerk. Leer lassen, wenn
-# nicht vorhanden.
+# Second Shelly, for example on a north-facing balcony PV system. Leave empty
+# if you do not have one.
 
-ECO_ABSURD = 30000          # W; alles darueber ist keine Messung mehr
+ECO_ABSURD = 30000          # W; beyond this it is not a reading
 
 GRID_TOPIC = os.getenv("GRID_TOPIC", "ecotracker/power")
 GRID_JSON_KEY = os.getenv("GRID_JSON_KEY", "power")
-GRID_MAX_AGE = 60          # s; aeltere Zaehlerwerte gelten als ungueltig
+GRID_MAX_AGE = 60          # s; older meter readings count as invalid
 
-DP_LIMIT = "121"           # Einspeisegrenze, schreibbar
+DP_LIMIT = "121"           # export limit, writable
 DP_CHARGE = "122"          # Netzladeleistung, schreibbar
-DP_AC_OUT = "155"          # tatsaechliche AC-Ausgangsleistung
-DP_BATT = "128"            # Batterieleistung, positiv = laden
-DP_OFFGRID = "119"         # Off-Grid-Steckdose ein/aus, schreibbar
-DP_BACKFLOW = "118"        # Rueckflussverhinderung: True = keine Einspeisung
-DP_SOC_MAX = "123"         # Lade-Stopp-SoC in %
-DP_SOC_MIN = "124"         # Entlade-Stopp-SoC in %
+DP_AC_OUT = "155"          # actual AC output power
+DP_BATT = "128"            # battery power, positive = charging
+DP_OFFGRID = "119"         # off-grid socket on/off, writable
+DP_BACKFLOW = "118"        # backflow prevention: True = no export
+DP_SOC_MAX = "123"         # charge-stop SoC in %
+DP_SOC_MIN = "124"         # discharge-stop SoC in %
 DP_PV_LIMIT = "156"        # PV-Ladeleistung, schreibbar
 
 LIMIT_MIN = 0
-LIMIT_MAX = int(os.getenv("LIMIT_MAX", "800"))   # gesetzliche Obergrenze
-LIMIT_SAFE = int(os.getenv("LIMIT_SAFE", "0"))   # Fallback beim Beenden
-# Einspeisegrenze, auf die zurueckgefallen wird, wenn der Zaehler laenger
-# als GRID_MAX_AGE keine Werte liefert. 0 stoppt die Einspeisung ganz,
-# ein positiver Wert speist blind weiter. Die Batterieladegrenze bleibt
-# davon unberuehrt, damit die PV weiter laden kann.
+LIMIT_MAX = int(os.getenv("LIMIT_MAX", "800"))   # legal ceiling
+LIMIT_SAFE = int(os.getenv("LIMIT_SAFE", "0"))   # fallback on shutdown
+# Export limit to fall back to when the meter has been silent for longer
+# than GRID_MAX_AGE. 0 stops export entirely; a positive value keeps feeding
+# blind. The battery charge limit is untouched so PV can keep charging.
 GRID_FAIL_LIMIT = int(os.getenv("GRID_FAIL_LIMIT", "0"))
-# Obergrenze fuer die Batterieladegrenze (DP 122). Das Geraet nimmt laut
-# Typenschild bis 4000 W ueber die vier MPPT-Eingaenge auf; der Akku selbst
-# begrenzt bei 60 A, also rund 3000 W. 2500 W ist der Vorgabewert aus der
-# App und deckt uebliche Anlagen ab.
+# Ceiling for the battery charge limit (DP 122). Per the type plate the device
+# takes up to 4000 W across its four MPPT inputs; the battery itself caps at
+# 60 A, around 3000 W. 2500 W is the app's default and covers typical
+# installations.
 CHARGE_HW_MAX = int(os.getenv("CHARGE_HW_MAX", "4000"))
 
-# Regelparameter. Startwerte; zur Laufzeit ueber HA verstellbar und per
-# retained MQTT gespeichert, ueberleben also einen Neustart der Bridge.
-# TUNABLES: key -> (Anzeigename, min, max, step, Einheit, Typ)
+# Controller parameters. Starting values; adjustable from HA at runtime and
+# stored as retained MQTT, so they survive a restart of the bridge.
+# TUNABLES: key -> (display name, min, max, step, unit, type)
 TUNABLES = {
-    "interval": ("Regelintervall",   3,   120, 1,   "s", int),
-    "gain":     ("Reglerverstaerkung", 0.1, 2.0, 0.1, None, float),
-    "deadband": ("Totband",          0,   200, 5,   "W", int),
-    "max_step": ("Max. Schrittweite", 10,  800, 10,  "W", int),
-    "charge_limit": ("Batterieladegrenze", 0, CHARGE_HW_MAX, 100, "W", int),
-    "soc_pass":  ("Durchleitung ab SoC", 50, 100, 1, "%", int),
-    "pv_max":    ("PV-Grenze offen", 500, 4000, 100, "W", int),
+    "interval": ("Control interval",   3,   120, 1,   "s", int),
+    "gain":     ("Controller gain", 0.1, 2.0, 0.1, None, float),
+    "deadband": ("Deadband",          0,   200, 5,   "W", int),
+    "max_step": ("Max step", 10,  800, 10,  "W", int),
+    "charge_limit": ("Battery charge limit", 0, CHARGE_HW_MAX, 100, "W", int),
+    "soc_pass":  ("Pass-through from SoC", 50, 100, 1, "%", int),
+    "pv_max":    ("PV limit when open", 500, 4000, 100, "W", int),
 }
 
 TUNE_DEFAULTS = {
@@ -136,167 +136,169 @@ TUNE_DEFAULTS = {
     "pv_max": 4000,
 }
 
-CTRL_MIN_STEP = 10         # W; kleinere Aenderungen werden nicht geschrieben
-WINDUP_MARGIN = 60         # W; wie weit der Sollwert vom Istwert abweichen darf
+CTRL_MIN_STEP = 10         # W; smaller changes are not written
+WINDUP_MARGIN = 60         # W; how far the setpoint may sit above actual
 
-# Durchleitung: Der EP2500 hat keinen direkten Pfad von PV zum Netz - die
-# Einspeisung kommt immer aus dem Akku, und PV geht immer in den Akku. Ein
-# stehender Ladestand heisst also: PV-Ladeleistung gleich Einspeiseleistung.
-# Beide Werte werden deshalb fest gesetzt und nur noch traege nachgefuehrt.
+# Pass-through: the EP2500 has no direct path from PV to the grid - export
+# always comes out of the battery, and PV always goes into it. A steady state
+# of charge therefore just means PV charge power equals export power. Both
+# values are set once and only trimmed slowly afterwards.
 #
-# Geregelt wird auf den Ladestand, nicht auf die Batterieleistung. Der
-# Ladestand ist genau die Groesse, die gehalten werden soll, und er ist
-# traege. Die Batterieleistung trifft mit 20 bis 70 s Verzoegerung ein - als
-# Regelgroesse fuehrt sie zu Schwingungen mit vollem Ausschlag.
-PASS_HYST = 5              # %-Punkte unter dem Ziel endet die Durchleitung
-PASS_STEP = 25             # W je normalem Nachfuehrschritt
-PASS_STEP_FAST = 150       # W je Schritt im Alarmbereich
-PASS_ADJUST = 180          # s zwischen zwei Nachfuehrschritten
-PASS_ADJUST_FAST = 45      # s im Alarmbereich
-PASS_ALARM = 3             # %-Punkte ueber Ziel = Alarmbereich
-PASS_SETTLE = 120          # s Ruhe nach dem Start, bevor nachgefuehrt wird
+# The control variable is the state of charge, not battery power. The state of
+# charge is exactly what should be held, and it moves slowly. Battery power
+# arrives 20 to 70 s late - using it as the control variable makes the loop
+# swing from one limit to the other.
+PASS_HYST = 5              # points below target where pass-through ends
+PASS_STEP = 25             # W per ordinary trim step
+PASS_STEP_FAST = 150       # W per step in the alarm range
+PASS_ADJUST = 180          # s between two trim steps
+PASS_ADJUST_FAST = 45      # s in the alarm range
+PASS_ALARM = 3             # points above target = alarm range
+PASS_SETTLE = 120          # s of quiet after start before trimming
 
-# Mindestdauer, die das Geraet den Standby verlassen haben muss, bevor die
-# Regelung wieder anlaeuft. Bei leerem Akku und schwacher Sonne kippt der
-# EP2500 im Sekundentakt hin und her - am 10.09. neunmal in 46 Minuten. Ohne
-# Entprellung besteht das Ereignisprotokoll nur noch aus diesen Wechseln.
+# How long the device must have been out of standby before control resumes.
+# On on empty battery in weak sun the EP2500 flips back and forth within
+# seconds - nine times in 46 minutes on 10.09. Without debouncing the event
+# log consists of nothing but those transitions.
 IDLE_HOLD = 180            # s
-PASS_BATT_BIAS = 50        # W je %-Punkt Abweichung, Zielwert fuers Gate
-PASS_PV_CAP = 2 * LIMIT_MAX  # W; hoeher braucht die Durchleitung nie
+PASS_BATT_BIAS = 50        # W per point of deviation, target for the gate
+PASS_PV_CAP = 2 * LIMIT_MAX  # W; pass-through never needs more
 
-# Das Geraet liefert einzelne Werte als vorzeichenlose 16-Bit-Zahl. 65535
-# ist dann keine Leistung, sondern -1. Ab dieser Schwelle wird zurueck-
-# gerechnet; alles ueber PLAUSI_MAX gilt danach als ungueltig und wird
-# verworfen, damit weder Anzeige noch Energiezaehler verfaelscht werden.
+# The device reports some values as unsigned 16-bit numbers. 65535 is then not
+# a power reading but -1. Above this threshold the value is converted back;
+# anything beyond PLAUSI_MAX afterwards counts as invalid and is discarded, so
+# neither the display nor the energy counters get corrupted.
 UINT16_SCHWELLE = 32768
 PLAUSI_MAX = {
-    "143": 5000,    # PV gesamt, Geraet kann max. 4000 W
+    "143": 5000,    # PV total, device takes 4000 W max
     "147": 1200, "151": 1200, "164": 1200, "180": 1200,   # je String max 1000 W
     "155": 3000,    # AC-Ausgang
-    "128": 3000,    # Batterieleistung
+    "128": 3000,    # battery power
     "137": 3000,    # Netzleistung
     "141": 3000,    # Off-Grid-Last
 }
-# Nur hier ist ein negativer Wert sinnvoll (er gibt die Richtung an).
-# PV-Leistungen koennen nie negativ sein - ein negativer Wert dort ist
-# ein Ueberlauf oder Messfehler und wird verworfen.
+# Only these may sensibly be negative (the sign carries the direction).
+# PV power can never be negative - a negative value there is on overflow or a
+# measurement error and gets discarded.
 NEGATIV_ERLAUBT = {"128", "137"}
 
-POLL_FULL = 60             # s zwischen zwei Vollstatus-Abfragen
-VERIFY_DELAY = 6           # s bis zur Nachpruefung eines Schaltbefehls
+POLL_FULL = 60             # s between two full status polls
+VERIFY_DELAY = 6           # s before a switch command is read back
 
-# DP 135 taugt NICHT als Zustandsanzeige fuer die Off-Grid-Steckdose. Ueber
-# drei Messreihen hinweg lag der Wert immer zwischen 231 und 237 V - auch
-# nachts im Standby, auch bei abgeschaltetem Ausgang, auch bei leerem Akku.
-# Offenbar wird eine interne Busspannung gemeldet und nicht die Dose. Ein
-# Waechter darauf hat nur Fehlalarme erzeugt und ist wieder ausgebaut.
+# DP 135 is NOT a state readout for the off-grid socket. Across three
+# measurement runs the value never left the 231 to 237 V band - overnight in
+# standby, with the output switched off, and on on empty battery alike. It
+# appears to report on internal bus voltage rather than the socket. A watchdog
+# built on it produced nothing but false alarms and was removed again.
 
-# Das Geraet gibt den Off-Grid-Ausgang erst wieder frei, wenn der Ladestand
-# den Entlade-Stopp um diesen Abstand ueberschreitet. Darunter nimmt es das
-# Setzen von DP 119 zwar an, der Ausgang bleibt aber tot. Am 11.09. gemessen:
-# Entlade-Stopp 15 %, Ausgang und Regelung kamen bei 20 % zurueck.
+# The device only releases the off-grid output once the state of charge is
+# this far above the discharge stop. Below that it accepts a write to DP 119
+# without complaint and leaves the output dead. Measured on 11.09.: discharge
+# stop at 15 %, output and control both came back at 20 %.
 OFFGRID_SOC_MARGIN = int(os.getenv("OFFGRID_SOC_MARGIN", "5"))
 HEARTBEAT = 9              # s
 
-# Aenderungen einzelner Datenpunkte mitschreiben. Zum Erforschen unbekannter
-# DPs: LOG_DPS=1 setzen, dann in der App eine Einstellung aendern und im Log
-# nachsehen, welcher Datenpunkt sich bewegt hat.
-#   LOG_DPS=0   aus (Standard)
-#   LOG_DPS=1   nur bisher unbekannte DPs (uebersichtlich)
-#   LOG_DPS=2   alle DPs, auch Messwerte (sehr gespraechig)
+# Log changes to individual datapoints. To identify unknown DPs: set
+# LOG_DPS=1, change a setting in the app, and check the log for which
+# datapoint moved.
+#   LOG_DPS=0   off (default)
+#   LOG_DPS=1   only DPs not yet mapped (readable)
+#   LOG_DPS=2   every DP including measurements (very chatty)
 LOG_DPS = int(os.getenv("LOG_DPS", "0"))
 
-# Bereits zugeordnete Datenpunkte - nur zur Beschriftung im Log.
+# Datapoints already mapped - used only to label the log.
 DP_NAMES = {
-    "102": "SoC", "117": "Modus", "118": "Rueckflussverhinderung",
-    "120": "Anti-Rueckstrom", "121": "Einspeisegrenze", "122": "Batterieladegrenze",
-    "123": "SoC max", "124": "SoC min", "125": "PV-Ertrag heute", "126": "PV-Ertrag gesamt", "127": "Batt-Spannung",
-    "128": "Batt-Leistung", "134": "Status", "137": "Netzleistung",
-    "138": "Netzfrequenz", "139": "Netzspannung", "143": "PV gesamt",
-    "147": "PV1-P", "148": "PV1-U", "150": "PV1-I", "151": "PV3-P",
-    "155": "AC-Ausgang", "156": "PV-Grenze", "163": "PV3-I", "164": "PV2-P",
-    "178": "PV2-U", "179": "PV2-I", "180": "PV4-P", "181": "PV4-U",
-    "182": "PV4-I", "183": "PV3-U",
-    "130": "Zelle max", "131": "Zelle min", "132": "Temperatur 1",
-    "133": "Temperatur 2", "140": "Off-Grid-Strom", "141": "Off-Grid-Last",
-    "107": "HW Hauptsteuerung", "108": "SW Hauptsteuerung",
-    "109": "HW Wechselrichter", "110": "SW Wechselrichter",
-    "112": "SW BMS", "113": "HW WLAN", "114": "SW WLAN",
-    "184": "SW Wechselrichter PV", "115": "Zaehler-Seriennummer",
-    "145": "OTA-URL", "152": "WLAN-Name (Zaehler)",
-    "153": "WLAN-Passwort (Zaehler)", "154": "Netzwerkschalter",
-    "136": "Netzstrom", "149": "Systemfehler",
-    "142": "Off-Grid-Last (2)", "135": "Off-Grid-Spannung", "119": "Off-Grid-Steckdose",
+    "102": "SoC", "117": "Mode", "118": "Backflow prevention",
+    "119": "Off-grid socket", "120": "Anti-backflow",
+    "121": "Export limit", "122": "Battery charge limit",
+    "123": "SoC max", "124": "SoC min",
+    "125": "PV energy today", "126": "PV energy total",
+    "127": "Batt voltage", "128": "Batt power",
+    "130": "Cell max", "131": "Cell min",
+    "132": "Temperature 1", "133": "Temperature 2",
+    "134": "Status", "135": "Off-grid voltage", "136": "Grid current",
+    "137": "Grid power", "138": "Grid frequency", "139": "Grid voltage",
+    "140": "Off-grid current", "141": "Off-grid load", "142": "Off-grid load (2)",
+    "143": "PV total", "147": "PV1-P", "148": "PV1-U", "150": "PV1-I",
+    "151": "PV3-P", "155": "AC output", "156": "PV limit",
+    "163": "PV3-I", "164": "PV2-P", "178": "PV2-U", "179": "PV2-I",
+    "180": "PV4-P", "181": "PV4-U", "182": "PV4-I", "183": "PV3-U",
+    "149": "System fault",
+    "107": "HW main control", "108": "SW main control",
+    "109": "HW inverter", "110": "SW inverter", "184": "SW inverter PV",
+    "112": "SW BMS", "113": "HW WiFi", "114": "SW WiFi",
+    "115": "Meter serial", "145": "OTA URL",
+    "152": "WiFi SSID (meter)", "153": "WiFi password (meter)",
+    "154": "Network switch",
 }
 
-# Messwerte, die sich staendig aendern - im Modus LOG_DPS=1 uninteressant.
+# Readings that change constantly - not interesting in LOG_DPS=1 mode.
 DP_NOISY = {"102", "125", "126", "127", "128", "135", "136", "137", "138",
             "139", "142", "143", "147", "148", "150", "151", "155", "163",
             "164", "178", "179", "180", "181", "182", "183"}
 
 
-def ist_standby(status):
-    """Erkennt den Standby-Zustand aus DP 134.
+def is_standby(status):
+    """Detects the standby state from DP 134.
 
-    Die Firmware schreibt "standy_status" (ohne b). Andere Versionen koennten
-    "standby" oder aehnliches liefern, deshalb wird nur auf den Wortstamm
-    geprueft.
+    The firmware writes "standy_status" (no b). Other versions might report
+    "standby" or something similar, so only the word stem is checked.
     """
     return "stand" in str(status).lower()
 
 
-def fehler_melden(wert):
-    """Meldet eine Aenderung am Systemfehlerregister (DP 149) als Ereignis.
+def report_fault(value):
+    """Raises on event when the system fault register (DP 149) changes.
 
-    Das harmlose Flackern zwischen 0 und 2 loest nichts aus, und beim Start
-    der Bridge wird nicht rueckwirkend eine Entwarnung gemeldet.
+    The harmless flicker between 0 and 2 triggers nothing, and no all-clear is
+    reported retroactively when the bridge starts.
     """
-    vorher = st.fehler_gemeldet
-    if wert == vorher:
+    before = st.fault_reported
+    if value == before:
         return
-    st.fehler_gemeldet = wert
-    text, ernst = fehler_klartext(wert)
-    if ernst:
-        event(f"Systemfehler {wert}: {text} - bleibt gespeichert, bis das "
-              f"Geraet neu gestartet wird")
-    elif vorher is not None and fehler_klartext(vorher)[1]:
-        event("Systemfehler zurueckgesetzt")
+    st.fault_reported = value
+    text, serious = fault_text(value)
+    if serious:
+        event(f"System fault {value}: {text} - latched until the device is "
+              f"restarted")
+    elif before is not None and fault_text(before)[1]:
+        event("System fault cleared")
 
 
-def log_changes(changed, quelle=""):
-    """Protokolliert geaenderte Datenpunkte und prueft das Fehlerregister.
+def log_changes(changed, source=""):
+    """Logs changed datapoints and checks the fault register.
 
-    Die Fehlerpruefung steht absichtlich vor der LOG_DPS-Schranke. Sie ist
-    keine Protokollierung, sondern eine Ueberwachung, und muss deshalb auch
-    dann laufen, wenn das DP-Log abgeschaltet ist.
+    The fault check deliberately sits before the LOG_DPS gate. It is
+    monitoring rather than logging, so it has to run even when DP logging is
+    switched off.
     """
     if not changed:
         return
     if "149" in changed:
-        fehler_melden(changed["149"][1])
+        report_fault(changed["149"][1])
     if not LOG_DPS:
         return
-    for dp, (alt, neu) in sorted(changed.items(), key=lambda x: int(x[0])):
+    for dp, (old, new) in sorted(changed.items(), key=lambda x: int(x[0])):
         if LOG_DPS == 1 and dp in DP_NOISY:
             continue
         name = DP_NAMES.get(dp, "?")
-        log.info("DP %-4s %-22s %r -> %r %s", dp, name, alt, neu, quelle)
+        log.info("DP %-4s %-22s %r -> %r %s", dp, name, old, new, source)
 
 
-EVENT_MAX_AGE = 48 * 3600   # s; aeltere Ereignisse fallen raus
-EVENT_MAX = 200             # Sicherheitsgrenze fuer die Attributgroesse
+EVENT_MAX_AGE = 48 * 3600   # s; older events are dropped
+EVENT_MAX = 200             # safety cap on the attribute size
 
 
 def event(text, auch_loggen=True):
-    """Haelt ein Ereignis fuer die Anzeige in Home Assistant fest."""
-    jetzt = time.time()
+    """Records on event for display in Home Assistant."""
+    now_ts = time.time()
     with st.lock:
         st.events.append({
-            "ts": int(jetzt),
-            "t": datetime.datetime.fromtimestamp(jetzt).strftime("%d.%m. %H:%M:%S"),
+            "ts": int(now_ts),
+            "t": datetime.datetime.fromtimestamp(now_ts).strftime("%d.%m. %H:%M:%S"),
             "m": text[:120],
         })
-        st.events = [e for e in st.events if jetzt - e["ts"] <= EVENT_MAX_AGE
+        st.events = [e for e in st.events if now_ts - e["ts"] <= EVENT_MAX_AGE
                      ][-EVENT_MAX:]
         liste = list(st.events)
     if auch_loggen:
@@ -308,7 +310,7 @@ def event(text, auch_loggen=True):
             "eintraege": liste,
         }), retain=True)
     except Exception as exc:
-        log.debug("Ereignis konnte nicht veroeffentlicht werden: %s", exc)
+        log.debug("Could not publish event: %s", exc)
 
 logging.basicConfig(
     level=os.getenv("LOGLEVEL", "INFO"),
@@ -319,108 +321,106 @@ log = logging.getLogger("ep2500")
 
 
 # --------------------------------------------------------------------------
-# Aufzeichnung
+# Recording
 # --------------------------------------------------------------------------
-# Per Schalter im Dashboard laesst sich alles, was die Bridge protokolliert,
-# zusaetzlich in eine Datei schreiben. Zum Herunterladen bringt die Bridge
-# einen kleinen HTTP-Server mit - das ist unabhaengig davon, ob Home
-# Assistant auf demselben Rechner laeuft, und braucht kein gemeinsames
-# Verzeichnis.
+# A switch on the dashboard makes the bridge mirror everything it logs into a
+# file as well. For downloading, the bridge brings its own small HTTP server -
+# that works regardless of whether Home Assistant runs on the same machine and
+# needs no shared directory.
 REC_DIR = os.getenv("REC_DIR", "/data/recordings")
 REC_PORT = int(os.getenv("REC_PORT", "8099"))
-REC_MAX_MB = int(os.getenv("REC_MAX_MB", "50"))   # je Datei
-REC_KEEP = int(os.getenv("REC_KEEP", "10"))       # aeltere Dateien loeschen
-# Adresse, unter der die Bridge aus dem Heimnetz erreichbar ist. Nur fuer
-# den Link im Dashboard - der Server selbst lauscht auf allen Adressen.
+REC_MAX_MB = int(os.getenv("REC_MAX_MB", "50"))   # per file
+REC_KEEP = int(os.getenv("REC_KEEP", "10"))       # delete older files
+# Address the bridge is reachable at on the home network. Used only to build
+# the dashboard link - the server itself listens on all addresses.
 REC_HOST = os.getenv("REC_HOST", "")
 
 
 class RecordHandler(logging.Handler):
-    """Schreibt Log-Zeilen in eine Datei, solange die Aufzeichnung laeuft.
+    """Writes log lines to a file while a recording is running.
 
-    Die Datei wird bei jeder Zeile geleert geschrieben (flush), damit ein
-    Herunterladen waehrend der Aufzeichnung den aktuellen Stand liefert und
-    ein Absturz nichts verschluckt.
+    The file is flushed after every line, so downloading during a recording
+    gives the current state and a crash swallows nothing.
     """
 
     def __init__(self):
         super().__init__()
-        self.lock_datei = threading.Lock()
-        self.datei = None
-        self.name_datei = None
-        self.zeilen = 0
-        self.start = None
+        self.file_lock = threading.Lock()
+        self.fh = None
+        self.file_name = None
+        self.lines = 0
+        self.started_at = None
 
     def emit(self, record):
-        with self.lock_datei:
-            if self.datei is None:
+        with self.file_lock:
+            if self.fh is None:
                 return
             try:
-                self.datei.write(self.format(record) + "\n")
-                self.datei.flush()
-                self.zeilen += 1
-                if self.zeilen % 500 == 0 and self._zu_gross():
+                self.fh.write(self.format(record) + "\n")
+                self.fh.flush()
+                self.lines += 1
+                if self.lines % 500 == 0 and self._too_big():
                     self._stop_intern("Groessengrenze erreicht")
             except Exception:
-                pass          # Eine kaputte Aufzeichnung darf nie die Regelung stoeren
+                pass          # a broken recording must never disturb control
 
-    def _zu_gross(self):
+    def _too_big(self):
         try:
-            return self.datei.tell() > REC_MAX_MB * 1024 * 1024
+            return self.fh.tell() > REC_MAX_MB * 1024 * 1024
         except Exception:
             return False
 
-    def _stop_intern(self, grund=""):
-        if self.datei is not None:
+    def _stop_intern(self, reason_txt=""):
+        if self.fh is not None:
             try:
-                self.datei.close()
+                self.fh.close()
             except Exception:
                 pass
-        self.datei = None
+        self.fh = None
 
-    def starten(self):
-        """Beginnt eine neue Aufzeichnung. Rueckgabe: Dateiname oder None."""
-        with self.lock_datei:
-            if self.datei is not None:
-                return self.name_datei
+    def start(self):
+        """Starts a new recording. Returns the file name, or None."""
+        with self.file_lock:
+            if self.fh is not None:
+                return self.file_name
             try:
                 os.makedirs(REC_DIR, exist_ok=True)
                 name = time.strftime("ep2500_%Y%m%d_%H%M%S.log")
-                self.datei = open(os.path.join(REC_DIR, name), "w",
+                self.fh = open(os.path.join(REC_DIR, name), "w",
                                   encoding="utf-8")
-                self.name_datei = name
-                self.zeilen = 0
-                self.start = time.time()
+                self.file_name = name
+                self.lines = 0
+                self.started_at = time.time()
             except Exception as exc:
-                log.error("Aufzeichnung konnte nicht starten: %s", exc)
-                self.datei = None
+                log.error("Recording could not start: %s", exc)
+                self.fh = None
                 return None
-        aufraeumen()
-        return self.name_datei
+        prune_recordings()
+        return self.file_name
 
-    def stoppen(self):
-        with self.lock_datei:
+    def stop(self):
+        with self.file_lock:
             self._stop_intern()
-            return self.name_datei
+            return self.file_name
 
-    def laeuft(self):
-        return self.datei is not None
+    def running(self):
+        return self.fh is not None
 
     def info(self):
-        with self.lock_datei:
-            groesse = 0
-            if self.datei is not None:
+        with self.file_lock:
+            size = 0
+            if self.fh is not None:
                 try:
-                    groesse = self.datei.tell()
+                    size = self.fh.tell()
                 except Exception:
                     pass
             return {
-                "aktiv": self.datei is not None,
-                "datei": self.name_datei,
-                "zeilen": self.zeilen,
-                "kb": round(groesse / 1024, 1),
-                "dauer_min": (round((time.time() - self.start) / 60, 1)
-                              if self.start and self.datei is not None else None),
+                "active": self.fh is not None,
+                "file": self.file_name,
+                "lines": self.lines,
+                "kib": round(size / 1024, 1),
+                "minutes": (round((time.time() - self.started_at) / 60, 1)
+                              if self.started_at and self.fh is not None else None),
             }
 
 
@@ -430,67 +430,67 @@ recorder.setFormatter(logging.Formatter(
 logging.getLogger().addHandler(recorder)
 
 
-def aufraeumen():
-    """Loescht alte Aufzeichnungen, damit die Platte nicht volllaeuft."""
+def prune_recordings():
+    """Deletes old recordings so the disk does not fill up."""
     try:
-        dateien = sorted(f for f in os.listdir(REC_DIR)
+        files = sorted(f for f in os.listdir(REC_DIR)
                          if f.startswith("ep2500_") and f.endswith(".log"))
-        for f in dateien[:-REC_KEEP]:
+        for f in files[:-REC_KEEP]:
             os.remove(os.path.join(REC_DIR, f))
-            log.info("Alte Aufzeichnung geloescht: %s", f)
+            log.info("Old recording deleted: %s", f)
     except Exception as exc:
-        log.warning("Aufraeumen fehlgeschlagen: %s", exc)
+        log.warning("Cleanup failed: %s", exc)
 
 
 class RecordServer(http.server.BaseHTTPRequestHandler):
-    """Listet die Aufzeichnungen und gibt sie zum Herunterladen frei."""
+    """Lists the recordings and serves them for download."""
 
     def log_message(self, *args):
-        pass              # nicht ins eigene Log schreiben, das gaebe eine Schleife
+        pass              # do not write to our own log, that would loop
 
     def do_GET(self):
-        pfad = self.path.split("?")[0]
-        if pfad in ("/", "/index.html"):
+        path_ = self.path.split("?")[0]
+        if path_ in ("/", "/index.html"):
             return self._index()
-        name = pfad.lstrip("/")
-        # Nur exakt die eigenen Dateinamen zulassen - kein ../ und kein
-        # beliebiger Pfad. Der Server laeuft ohne Anmeldung im Heimnetz.
+        name = path_.lstrip("/")
+        # Allow only our own file names - no ../ and no arbitrary path. The
+        # server runs without authentication on the home network.
         if not re.fullmatch(r"ep2500_\d{8}_\d{6}\.log", name):
             self.send_error(404)
             return
-        voll = os.path.join(REC_DIR, name)
-        if not os.path.isfile(voll):
+        full = os.path.join(REC_DIR, name)
+        if not os.path.isfile(full):
             self.send_error(404)
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{name}"')
-        self.send_header("Content-Length", str(os.path.getsize(voll)))
+        self.send_header("Content-Length", str(os.path.getsize(full)))
         self.end_headers()
-        with open(voll, "rb") as fh:
+        with open(full, "rb") as fh:
             shutil.copyfileobj(fh, self.wfile)
 
     def _index(self):
         try:
-            dateien = sorted((f for f in os.listdir(REC_DIR)
+            files = sorted((f for f in os.listdir(REC_DIR)
                               if f.startswith("ep2500_") and f.endswith(".log")),
                              reverse=True)
         except Exception:
-            dateien = []
-        zeilen = ["<!doctype html><meta charset='utf-8'>",
-                  "<title>EP2500 Aufzeichnungen</title>",
-                  "<h1>EP2500 Aufzeichnungen</h1>"]
-        if not dateien:
-            zeilen.append("<p>Noch keine Aufzeichnung vorhanden.</p>")
+            files = []
+        lines = ["<!doctype html><meta charset='utf-8'>",
+                  "<title>EP2500 recordings</title>",
+                  "<h1>EP2500 recordings</h1>"]
+        if not files:
+            lines.append("<p>No recordings yet.</p>")
         else:
-            zeilen.append("<ul>")
-            for f in dateien:
-                kb = os.path.getsize(os.path.join(REC_DIR, f)) / 1024
-                aktiv = " (laeuft)" if f == recorder.name_datei and recorder.laeuft() else ""
-                zeilen.append(f"<li><a href='/{f}'>{f}</a> &ndash; "
-                              f"{kb:.0f} kB{aktiv}</li>")
-            zeilen.append("</ul>")
-        body = "\n".join(zeilen).encode("utf-8")
+            lines.append("<ul>")
+            for f in files:
+                kib = os.path.getsize(os.path.join(REC_DIR, f)) / 1024
+                active = " (running)" if f == recorder.file_name and recorder.running() else ""
+                lines.append(f"<li><a href='/{f}'>{f}</a> &ndash; "
+                              f"{kib:.0f} kB{active}</li>")
+            lines.append("</ul>")
+        body = "\n".join(lines).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -504,7 +504,7 @@ class LeiserServer(socketserver.ThreadingTCPServer):
 
 
 def record_info_loop():
-    """Haelt die Statusanzeige der Aufzeichnung aktuell."""
+    """Keeps the recording status display up to date."""
     while True:
         time.sleep(30)
         try:
@@ -516,55 +516,55 @@ def record_info_loop():
 def record_server_loop():
     try:
         with LeiserServer(("", REC_PORT), RecordServer) as srv:
-            log.info("Aufzeichnungen abrufbar auf Port %s", REC_PORT)
+            log.info("Recordings available on port %s", REC_PORT)
             srv.serve_forever()
     except Exception as exc:
-        log.error("Aufzeichnungsserver nicht gestartet: %s", exc)
+        log.error("Recording server did not start: %s", exc)
 
 # --------------------------------------------------------------------------
-# Entitaeten fuer die HA-Discovery
+# Entities for HA discovery
 # --------------------------------------------------------------------------
-# (dp, key, Anzeigename, Einheit, device_class, state_class, Faktor)
+# (dp, key, display name, unit, device_class, state_class, factor)
 
 SENSORS = [
-    ("102", "soc",           "Ladestand",           "%",   "battery",     "measurement", 1),
-    ("155", "ac_out",        "AC-Ausgangsleistung", "W",   "power",       "measurement", 1),
-    ("128", "batt_power",    "Batterieleistung",    "W",   "power",       "measurement", 1),
-    ("137", "grid_power",    "Netzleistung",        "W",   "power",       "measurement", 1),
-    ("143", "pv_power",      "PV-Leistung",         "W",   "power",       "measurement", 1),
-    ("125", "pv_energy",     "PV-Ertrag heute",     "Wh",  "energy", "total_increasing", 1),
-    ("126", "pv_energy_all", "PV-Ertrag gesamt",    "Wh",  "energy", "total_increasing", 1),
-    ("127", "batt_voltage",  "Batteriespannung",    "V",   "voltage",     "measurement", 0.01),
-    ("139", "grid_voltage",  "Netzspannung",        "V",   "voltage",     "measurement", 0.1),
-    ("138", "grid_freq",     "Netzfrequenz",        "Hz",  "frequency",   "measurement", 0.01),
-    ("136", "grid_current",  "Netzstrom",           "A",   "current",     "measurement", 0.1),
+    ("102", "soc",           "State of charge",           "%",   "battery",     "measurement", 1),
+    ("155", "ac_out",        "AC output power", "W",   "power",       "measurement", 1),
+    ("128", "batt_power",    "Battery power",    "W",   "power",       "measurement", 1),
+    ("137", "grid_power",    "Grid power",        "W",   "power",       "measurement", 1),
+    ("143", "pv_power",      "PV power",         "W",   "power",       "measurement", 1),
+    ("125", "pv_energy",     "PV energy today",     "Wh",  "energy", "total_increasing", 1),
+    ("126", "pv_energy_all", "PV energy total",    "Wh",  "energy", "total_increasing", 1),
+    ("127", "batt_voltage",  "Battery voltage",    "V",   "voltage",     "measurement", 0.01),
+    ("139", "grid_voltage",  "Grid voltage",        "V",   "voltage",     "measurement", 0.1),
+    ("138", "grid_freq",     "Grid frequency",        "Hz",  "frequency",   "measurement", 0.01),
+    ("136", "grid_current",  "Grid current",           "A",   "current",     "measurement", 0.1),
     ("134", "status",        "Status",              None,  None,          None,          None),
-    ("117", "mode",          "Betriebsmodus",       None,  None,          None,          None),
-    # Vier MPPT-Strings. Leistung, Spannung und Strom liegen im Geraet
-    # nicht zusammenhaengend, die Zuordnung ist gegen die App verifiziert.
-    ("147", "pv1_power",     "PV1-Leistung",        "W",   "power",       "measurement", 1),
-    ("148", "pv1_voltage",   "PV1-Spannung",        "V",   "voltage",     "measurement", 0.1),
-    ("150", "pv1_current",   "PV1-Strom",           "A",   "current",     "measurement", 0.01),
-    ("164", "pv2_power",     "PV2-Leistung",        "W",   "power",       "measurement", 1),
-    ("178", "pv2_voltage",   "PV2-Spannung",        "V",   "voltage",     "measurement", 0.1),
-    ("179", "pv2_current",   "PV2-Strom",           "A",   "current",     "measurement", 0.01),
-    ("151", "pv3_power",     "PV3-Leistung",        "W",   "power",       "measurement", 1),
-    ("183", "pv3_voltage",   "PV3-Spannung",        "V",   "voltage",     "measurement", 0.1),
-    ("163", "pv3_current",   "PV3-Strom",           "A",   "current",     "measurement", 0.01),
-    ("180", "pv4_power",     "PV4-Leistung",        "W",   "power",       "measurement", 1),
-    ("181", "pv4_voltage",   "PV4-Spannung",        "V",   "voltage",     "measurement", 0.1),
-    ("182", "pv4_current",   "PV4-Strom",           "A",   "current",     "measurement", 0.01),
-    # Batterie-Innenwerte (16S2P laut Typenschild)
-    ("130", "cell_max",      "Zellspannung max",    "mV",  "voltage",     "measurement", 1),
-    ("131", "cell_min",      "Zellspannung min",    "mV",  "voltage",     "measurement", 1),
-    ("132", "temp1",         "Temperatur 1",        "°C",  "temperature", "measurement", 0.1),
-    ("133", "temp2",         "Temperatur 2",        "°C",  "temperature", "measurement", 0.1),
-    ("140", "offgrid_curr",  "Off-Grid-Strom",      "A",   "current",     "measurement", 0.1),
-    ("156", "pv_limit",      "PV-Ladegrenze",       "W",   "power",       "measurement", 1),
-    # Off-Grid-Steckdose: laeuft separat und ist im AC-Ausgang (155) NICHT
-    # enthalten. DP 142 zeigt denselben Wert.
-    ("141", "offgrid_power", "Off-Grid-Last",       "W",   "power",       "measurement", 1),
-    ("135", "offgrid_volt",  "Off-Grid-Spannung",   "V",   "voltage",     "measurement", 0.1),
+    ("117", "mode",          "Operating mode",       None,  None,          None,          None),
+    # Four MPPT strings. Power, voltage and current are not stored
+    # contiguously in the device; the mapping was verified against the app.
+    ("147", "pv1_power",     "PV1 power",        "W",   "power",       "measurement", 1),
+    ("148", "pv1_voltage",   "PV1 voltage",        "V",   "voltage",     "measurement", 0.1),
+    ("150", "pv1_current",   "PV1 current",           "A",   "current",     "measurement", 0.01),
+    ("164", "pv2_power",     "PV2 power",        "W",   "power",       "measurement", 1),
+    ("178", "pv2_voltage",   "PV2 voltage",        "V",   "voltage",     "measurement", 0.1),
+    ("179", "pv2_current",   "PV2 current",           "A",   "current",     "measurement", 0.01),
+    ("151", "pv3_power",     "PV3 power",        "W",   "power",       "measurement", 1),
+    ("183", "pv3_voltage",   "PV3 voltage",        "V",   "voltage",     "measurement", 0.1),
+    ("163", "pv3_current",   "PV3 current",           "A",   "current",     "measurement", 0.01),
+    ("180", "pv4_power",     "PV4 power",        "W",   "power",       "measurement", 1),
+    ("181", "pv4_voltage",   "PV4 voltage",        "V",   "voltage",     "measurement", 0.1),
+    ("182", "pv4_current",   "PV4 current",           "A",   "current",     "measurement", 0.01),
+    # Battery internals (16S2P per the type plate)
+    ("130", "cell_max",      "Cell voltage max",    "mV",  "voltage",     "measurement", 1),
+    ("131", "cell_min",      "Cell voltage min",    "mV",  "voltage",     "measurement", 1),
+    ("132", "temp1",         "Temperature 1",        "°C",  "temperature", "measurement", 0.1),
+    ("133", "temp2",         "Temperature 2",        "°C",  "temperature", "measurement", 0.1),
+    ("140", "offgrid_curr",  "Off-grid current",      "A",   "current",     "measurement", 0.1),
+    ("156", "pv_limit",      "PV charge limit",       "W",   "power",       "measurement", 1),
+    # Off-grid socket: runs on a separate path and is NOT included in the AC
+    # output (155). DP 142 carries the same value.
+    ("141", "offgrid_power", "Off-grid load",       "W",   "power",       "measurement", 1),
+    ("135", "offgrid_volt",  "Off-grid voltage",   "V",   "voltage",     "measurement", 0.1),
 ]
 
 DEVICE_INFO = {
@@ -576,37 +576,37 @@ DEVICE_INFO = {
 
 
 # --------------------------------------------------------------------------
-# Gemeinsamer Zustand
+# Shared state
 # --------------------------------------------------------------------------
 
 class State:
     def __init__(self):
         self.lock = threading.Lock()
         self.dps = {}              # Cache aller bekannten Datenpunkte
-        self.grid = None           # letzter Zaehlerwert in W
+        self.grid = None           # previous Zaehlerwert in W
         self.grid_ts = 0.0
-        self.grid_verdacht = None  # noch unbestaetigter Sprungwert
-        self.control_on = False    # Regelung aktiv?
-        self.correction = 0        # Zielwert am Zaehler in W
+        self.grid_suspect = None  # jump value awaiting confirmation
+        self.control_on = False    # control active?
+        self.correction = 0        # target at the meter, in W
         self.last_write = 0.0
         self.online = False
         self.tune = dict(TUNE_DEFAULTS)
         self.restored = set()      # welche Werte kamen schon aus MQTT zurueck
-        self.idle_logged = False   # Leerlauf-Sperre bereits gemeldet?
-        self.idle_since = 0.0      # zuletzt im Leerlauf gesehen
-        self.offgrid_gemeldet = False
-        self.fehler_gemeldet = None  # zuletzt als Ereignis gemeldeter DP 149
-        self.pass_on = False       # Durchleitung freigegeben?
-        self.pass_aktiv = False    # Durchleitung laeuft gerade?
-        self.pass_pv_soll = 0      # W; nachgefuehrte PV-Ladeleistung
-        self.pass_next = 0.0       # Zeitpunkt des naechsten Nachfuehrschritts
-        self.pv_reopen = False     # PV-Grenze nach Durchleitung noch zu oeffnen?
-        self.grid_fail = False     # Zaehlerausfall bereits behandelt?
-        self.soll = 0.0            # interner Sollwert: >0 einspeisen, <0 laden
-        self.events = []           # Ereignisliste fuer das Dashboard
-        self.last_status = None    # letzter Geraetestatus (fuer Ereignisse)
-        self.last_dir = None       # letzte Richtung: "ein", "laden", "aus"
-        self.was_offline = False   # Verbindungsabbruch schon gemeldet?
+        self.idle_logged = False   # idle lock already reported?
+        self.idle_since = 0.0      # last seen idle
+        self.offgrid_reported = False
+        self.fault_reported = None  # DP 149 value last reported as an event
+        self.pass_on = False       # pass-through enabled?
+        self.pass_active = False   # pass-through running right now?
+        self.pass_pv_setpoint = 0      # W; trimmed PV charge power
+        self.pass_next = 0.0       # time of the next trim step
+        self.pv_reopen = False     # PV limit still to reopen after pass-through?
+        self.grid_fail = False     # meter failure already handled?
+        self.setpoint = 0.0            # internal setpoint: >0 export, <0 charge
+        self.events = []           # event list for the dashboard
+        self.last_status = None    # previous Geraetestatus (fuer Ereignisse)
+        self.last_dir = None       # last direction: on / charging / off
+        self.was_offline = False   # disconnect already reported?
         self.shelly_ip = SHELLY_IP
         self.shelly_power = None
         self.shelly_on = None
@@ -617,20 +617,20 @@ class State:
         self.shelly2_fails = 0
 
     def tune_get(self, key):
-        """Liest einen Regelparameter unter Sperre."""
+        """Reads a controller parameter under the lock."""
         with self.lock:
             return self.tune[key]
 
-    def tune_set(self, key, wert):
+    def tune_set(self, key, value):
         with self.lock:
-            self.tune[key] = wert
+            self.tune[key] = value
 
     def merge(self, dps):
-        """Uebernimmt Werte in den Cache und liefert die Aenderungen zurueck.
+        """Merges values into the cache and returns what changed.
 
-        Unplausible Messwerte werden dabei verworfen: 16-Bit-Ueberlaeufe
-        werden in negative Zahlen zurueckgerechnet, Werte ausserhalb des
-        physikalisch Moeglichen fliegen ganz raus.
+        Implausible readings are dropped along the way: 16-bit overflows are
+        converted back to negative numbers, and anything outside what is
+        physically possible is discarded entirely.
         """
         changed = {}
         with self.lock:
@@ -640,7 +640,7 @@ class State:
                     if v >= UINT16_SCHWELLE:
                         v = v - 65536
                     if abs(v) > grenze or (v < 0 and k not in NEGATIV_ERLAUBT):
-                        log.warning("DP %s: %s W unplausibel - verworfen", k, v)
+                        log.warning("DP %s: %s W implausible - discarded", k, v)
                         continue
                 if self.dps.get(k) != v:
                     changed[k] = (self.dps.get(k), v)
@@ -660,7 +660,7 @@ st = State()
 # --------------------------------------------------------------------------
 
 def publish_discovery(client):
-    """Legt die HA-Entitaeten an. retain=True, damit sie Neustarts ueberleben."""
+    """Creates the HA entities. retain=True so they survive restarts."""
     for dp, key, name, unit, dev_cls, state_cls, _factor in SENSORS:
         cfg = {
             "name": name,
@@ -679,9 +679,9 @@ def publish_discovery(client):
         client.publish(f"{DISC}/sensor/ep2500/{key}/config",
                        json.dumps(cfg), retain=True)
 
-    # Einspeisegrenze als Number
+    # Export limit as a number entity
     client.publish(f"{DISC}/number/ep2500/limit/config", json.dumps({
-        "name": "Einspeisegrenze",
+        "name": "Export limit",
         "unique_id": "ep2500_limit",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ value_json.limit }}",
@@ -693,9 +693,9 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Regelung ein/aus
+    # Control on/off
     client.publish(f"{DISC}/switch/ep2500/control/config", json.dumps({
-        "name": "Nulleinspeisung-Regelung",
+        "name": "Zero-export control",
         "unique_id": "ep2500_control",
         "state_topic": f"{BASE}/control/state",
         "command_topic": f"{BASE}/control/set",
@@ -704,9 +704,9 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Korrekturwert: Zielwert am Zaehler statt 0
+    # Meter target: aim for this instead of 0
     client.publish(f"{DISC}/number/ep2500/correction/config", json.dumps({
-        "name": "Korrekturwert",
+        "name": "Meter target",
         "unique_id": "ep2500_correction",
         "state_topic": f"{BASE}/correction/state",
         "command_topic": f"{BASE}/correction/set",
@@ -717,9 +717,9 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Zaehlerwert, den der Regler tatsaechlich sieht
+    # The meter reading the controller actually sees
     client.publish(f"{DISC}/sensor/ep2500/grid/config", json.dumps({
-        "name": "Zaehlerleistung (Regler)",
+        "name": "Meter power (controller)",
         "unique_id": "ep2500_grid",
         "state_topic": f"{BASE}/grid",
         "unit_of_measurement": "W",
@@ -729,10 +729,10 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Ladeleistungsgrenze der Batterie (DP 122) - gilt fuer PV UND Netz.
-    # Steht der Wert auf 0, nimmt das Geraet gar keinen Solarstrom mehr auf.
+    # Battery charge power limit (DP 122) - applies to PV AND grid charging.
+    # At 0 the device stops taking in any solar power at all.
     client.publish(f"{DISC}/number/ep2500/charge/config", json.dumps({
-        "name": "Batterieladegrenze",
+        "name": "Battery charge limit",
         "unique_id": "ep2500_charge",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ value_json.charge }}",
@@ -744,10 +744,10 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Rueckflussverhinderung (DP 118). Eingeschaltet sperrt sie die
-    # Einspeisung ins Netz - das Geraet geht dann in den Standby.
+    # Backflow prevention (DP 118). Switched on it blocks export to the grid -
+    # the device then goes to standby.
     client.publish(f"{DISC}/switch/ep2500/backflow/config", json.dumps({
-        "name": "Rueckflussverhinderung",
+        "name": "Backflow prevention",
         "icon": "mdi:transmission-tower-export",
         "unique_id": "ep2500_backflow",
         "state_topic": f"{BASE}/state",
@@ -758,9 +758,9 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Interner Sollwert des Reglers: >0 einspeisen, <0 laden
-    client.publish(f"{DISC}/sensor/ep2500/soll/config", json.dumps({
-        "name": "Regler-Sollwert",
+    # The controller's internal setpoint: >0 export, <0 charge
+    client.publish(f"{DISC}/sensor/ep2500/setpoint/config", json.dumps({
+        "name": "Controller setpoint",
         "unique_id": "ep2500_soll",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ value_json.soll }}",
@@ -771,10 +771,10 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Off-Grid-Steckdose am Geraet (DP 119). Weckt den Wechselrichter aus
-    # dem Standby, kostet also Eigenverbrauch, wenn nichts angeschlossen ist.
+    # Off-grid socket on the device (DP 119). It wakes the inverter from
+    # standby, so it costs idle power even with nothing plugged in.
     client.publish(f"{DISC}/switch/ep2500/offgrid/config", json.dumps({
-        "name": "Off-Grid-Steckdose",
+        "name": "Off-grid socket",
         "unique_id": "ep2500_offgrid",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ 'ON' if value_json.offgrid else 'OFF' }}",
@@ -785,9 +785,9 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Messender Shelly als unabhaengige Gegenprobe
+    # Metering Shelly as on independent cross-check
     client.publish(f"{DISC}/sensor/ep2500/shelly/config", json.dumps({
-        "name": "Shelly Leistung",
+        "name": "Shelly power",
         "unique_id": "ep2500_shelly",
         "state_topic": f"{BASE}/shelly",
         "value_template": "{{ value_json.power }}",
@@ -799,10 +799,10 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Harter Ein/Aus-Schalter. Trennt das Geraet vollstaendig vom Netz -
-    # die Bridge verliert dabei die Verbindung.
+    # Hard on/off switch. Disconnects the device from mains entirely - the
+    # bridge loses its connection while it is off.
     client.publish(f"{DISC}/switch/ep2500/shelly/config", json.dumps({
-        "name": "Shelly (Netztrennung)",
+        "name": "Shelly (mains disconnect)",
         "unique_id": "ep2500_shelly_switch",
         "state_topic": f"{BASE}/shelly",
         "value_template": "{{ value_json.state }}",
@@ -813,9 +813,9 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Zweiter Shelly, z. B. am Nord-Balkonkraftwerk
+    # Second Shelly, for example on a north-facing balcony PV system
     client.publish(f"{DISC}/sensor/ep2500/shelly2/config", json.dumps({
-        "name": "Nord-BKW Leistung",
+        "name": "North PV power",
         "unique_id": "ep2500_shelly2",
         "state_topic": f"{BASE}/shelly2",
         "value_template": "{{ value_json.power }}",
@@ -827,7 +827,7 @@ def publish_discovery(client):
     }), retain=True)
 
     client.publish(f"{DISC}/switch/ep2500/shelly2/config", json.dumps({
-        "name": "Nord-BKW",
+        "name": "North PV",
         "unique_id": "ep2500_shelly2_switch",
         "state_topic": f"{BASE}/shelly2",
         "value_template": "{{ value_json.state }}",
@@ -839,7 +839,7 @@ def publish_discovery(client):
     }), retain=True)
 
     client.publish(f"{DISC}/text/ep2500/shelly2_ip/config", json.dumps({
-        "name": "Nord-BKW Shelly IP",
+        "name": "North PV Shelly IP",
         "unique_id": "ep2500_shelly2_ip",
         "state_topic": f"{BASE}/shelly2_ip",
         "command_topic": f"{BASE}/shelly2_ip/set",
@@ -860,10 +860,10 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # SoC-Grenzen des Geraets
+    # The device's own SoC limits
     for key, dp, name, icon in (
-            ("socmax", DP_SOC_MAX, "Lade-Stopp", "mdi:battery-charging-high"),
-            ("socmin", DP_SOC_MIN, "Entlade-Stopp", "mdi:battery-low")):
+            ("socmax", DP_SOC_MAX, "Charge stop", "mdi:battery-charging-high"),
+            ("socmin", DP_SOC_MIN, "Discharge stop", "mdi:battery-low")):
         client.publish(f"{DISC}/number/ep2500/{key}/config", json.dumps({
             "name": name,
             "unique_id": f"ep2500_{key}",
@@ -880,10 +880,10 @@ def publish_discovery(client):
             "device": DEVICE_INFO,
         }), retain=True)
 
-    # Durchleitung: bei vollem Akku PV-Ueberschuss ins Netz statt
-    # Nulleinspeisung
+    # Pass-through: with a full battery, send the PV surplus to the grid
+    # instead of holding zero export
     client.publish(f"{DISC}/switch/ep2500/passthrough/config", json.dumps({
-        "name": "Durchleitung bei vollem Akku",
+        "name": "Pass-through when battery full",
         "unique_id": "ep2500_passthrough",
         "state_topic": f"{BASE}/passthrough/state",
         "command_topic": f"{BASE}/passthrough/set",
@@ -894,7 +894,7 @@ def publish_discovery(client):
     }), retain=True)
 
     client.publish(f"{DISC}/binary_sensor/ep2500/pass_active/config", json.dumps({
-        "name": "Durchleitung laeuft",
+        "name": "Pass-through running",
         "unique_id": "ep2500_pass_active",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ 'ON' if value_json.passthrough else 'OFF' }}",
@@ -905,7 +905,7 @@ def publish_discovery(client):
     }), retain=True)
 
     client.publish(f"{DISC}/sensor/ep2500/runtime/config", json.dumps({
-        "name": "Restlaufzeit",
+        "name": "Remaining runtime",
         "unique_id": "ep2500_runtime",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ value_json.runtime }}",
@@ -916,11 +916,11 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Systemfehler (DP 149). Der Wert bleibt nach einer Stoerung gespeichert
-    # und verschwindet erst durch einen Neustart des Geraets - ohne Anzeige
-    # laeuft die Anlage sonst tagelang mit einer Meldung, die niemand sieht.
+    # System fault (DP 149). The value latches after a fault and only clears
+    # when the device is restarted - without a sensor the system runs for days
+    # carrying a fault nobody sees.
     client.publish(f"{DISC}/sensor/ep2500/fault/config", json.dumps({
-        "name": "Systemfehler",
+        "name": "System fault",
         "unique_id": "ep2500_fault",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ value_json.fault_text }}",
@@ -933,7 +933,7 @@ def publish_discovery(client):
     }), retain=True)
 
     client.publish(f"{DISC}/binary_sensor/ep2500/fault_active/config", json.dumps({
-        "name": "Stoerung",
+        "name": "Fault",
         "unique_id": "ep2500_fault_active",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ 'ON' if value_json.fault_active else 'OFF' }}",
@@ -944,9 +944,9 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Aufzeichnung: Schalter und Statusanzeige
+    # Recording: switch and status display
     client.publish(f"{DISC}/switch/ep2500/record/config", json.dumps({
-        "name": "Protokoll aufzeichnen",
+        "name": "Record log",
         "unique_id": "ep2500_record",
         "state_topic": f"{BASE}/record/state",
         "command_topic": f"{BASE}/record/set",
@@ -958,7 +958,7 @@ def publish_discovery(client):
     }), retain=True)
 
     client.publish(f"{DISC}/sensor/ep2500/record_info/config", json.dumps({
-        "name": "Aufzeichnung",
+        "name": "Recording",
         "unique_id": "ep2500_record_info",
         "state_topic": f"{BASE}/record/info",
         "value_template": "{{ value_json.text }}",
@@ -969,9 +969,9 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Ereignisprotokoll der letzten 48 Stunden
+    # Event log of the last 48 hours
     client.publish(f"{DISC}/sensor/ep2500/events/config", json.dumps({
-        "name": "Ereignisse",
+        "name": "Events",
         "unique_id": "ep2500_events",
         "state_topic": f"{BASE}/events",
         "value_template": "{{ value_json.last[:250] }}",
@@ -984,7 +984,7 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Regelparameter als Number-Entitaeten
+    # Controller parameters as number entities
     for key, (name, vmin, vmax, step, unit, _typ) in TUNABLES.items():
         cfg = {
             "name": name,
@@ -1002,18 +1002,18 @@ def publish_discovery(client):
         client.publish(f"{DISC}/number/ep2500/tune_{key}/config",
                        json.dumps(cfg), retain=True)
 
-    # Abgeloeste Entitaeten entfernen (leere Payload loescht sie in HA)
-    for pfad in ("switch/ep2500/gridcharge", "number/ep2500/tune_charge_max",
+    # Remove retired entities (on empty payload deletes them in HA)
+    for path_ in ("switch/ep2500/gridcharge", "number/ep2500/tune_charge_max",
                  "number/ep2500/tune_hyst", "sensor/ep2500/pv_strings",
                  "number/ep2500/tune_pass_marge",
                  "binary_sensor/ep2500/offgrid_live"):
-        client.publish(f"{DISC}/{pfad}/config", "", retain=True)
+        client.publish(f"{DISC}/{path_}/config", "", retain=True)
 
-    log.info("Discovery veroeffentlicht")
+    log.info("Discovery published")
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    log.info("MQTT verbunden (rc=%s)", rc)
+    log.info("MQTT connected (rc=%s)", rc)
     publish_discovery(client)
     for t in (f"{BASE}/limit/set", f"{BASE}/control/set", f"{BASE}/charge/set",
               f"{BASE}/backflow/set", f"{BASE}/correction/set",
@@ -1027,8 +1027,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
         client.subscribe(GRID_TOPIC)
     client.subscribe(f"{BASE}/tune/+/set")
 
-    # Retained States mitlesen, um Einstellungen nach einem Neustart
-    # wiederherzustellen, statt sie mit den Defaults zu ueberschreiben.
+    # Read retained states back so settings are restored after a restart
+    # instead of being overwritten with the defaults.
     client.subscribe(f"{BASE}/tune/+")
     client.subscribe(f"{BASE}/correction/state")
     client.subscribe(f"{BASE}/control/state")
@@ -1037,8 +1037,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{BASE}/shelly_ip")
     client.subscribe(f"{BASE}/shelly2_ip")
 
-    # Nach einem MQTT-Reconnect den Verfuegbarkeitsstatus erneut senden,
-    # sonst zeigt HA die Entitaeten dauerhaft als nicht verfuegbar an.
+    # Re-send the availability state after on MQTT reconnect, otherwise HA
+    # shows the entities as permanently unavailable.
     client.publish(f"{BASE}/available",
                    "online" if st.online else "offline", retain=True)
 
@@ -1046,13 +1046,13 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 
 def publish_settings():
-    """Veroeffentlicht alles, was nicht aus retained MQTT zurueckkam."""
+    """Publishes everything that did not come back from retained MQTT."""
     if "control" not in st.restored:
         mqttc.publish(f"{BASE}/control/state",
                       "ON" if st.control_on else "OFF", retain=True)
-    # Leere Adressen nicht veroeffentlichen. Eine leere retained Nachricht
-    # loescht den gespeicherten Wert im Broker, und das Textfeld in Home
-    # Assistant zeigt danach "empty value" an, obwohl vorher etwas drinstand.
+    # Do not publish empty addresses. An empty retained message deletes the
+    # stored value in the broker, and the text field in Home Assistant then
+    # shows "empty value" even though something was in it before.
     if "shelly_ip" not in st.restored and st.shelly_ip:
         mqttc.publish(f"{BASE}/shelly_ip", st.shelly_ip, retain=True)
     if "shelly2_ip" not in st.restored and st.shelly2_ip:
@@ -1065,28 +1065,28 @@ def publish_settings():
     for key, val in st.tune.items():
         if key not in st.restored:
             mqttc.publish(f"{BASE}/tune/{key}", val, retain=True)
-    log.info("Regelparameter: %s", st.tune)
-    # Beim Auswerten hilft es zu sehen, welche Adressen wirklich ankamen -
-    # eine nicht uebernommene Umgebungsvariable faellt sonst nicht auf.
-    log.info("Shelly-Adressen: Netztrennung=%r  Nord-BKW=%r",
-             st.shelly_ip or "(leer)", st.shelly2_ip or "(leer)")
+    log.info("Controller parameters: %s", st.tune)
+    # When reading logs it helps to see which addresses actually arrived - on
+    # environment variable that never made it is otherwise easy to miss.
+    log.info("Shelly addresses: mains disconnect=%r  north PV=%r",
+             st.shelly_ip or "(empty)", st.shelly2_ip or "(empty)")
 
 
 def on_message(client, userdata, msg):
     payload = msg.payload.decode(errors="replace").strip()
     topic = msg.topic
 
-    # Regelparameter setzen: ep2500/tune/<key>/set
+    # Set a controller parameter: ep2500/tune/<key>/set
     if topic.startswith(f"{BASE}/tune/") and topic.endswith("/set"):
         key = topic.split("/")[-2]
         apply_tune(key, payload, source="HA")
         return
 
-    # Gespeicherten Wert nach Neustart uebernehmen: ep2500/tune/<key>
+    # Take a stored value after a restart: ep2500/tune/<key>
     if topic.startswith(f"{BASE}/tune/"):
         key = topic.split("/")[-1]
         if key in TUNABLES and key not in st.restored:
-            if apply_tune(key, payload, source="gespeichert", echo=False):
+            if apply_tune(key, payload, source="restored", echo=False):
                 st.restored.add(key)
         return
 
@@ -1094,20 +1094,20 @@ def on_message(client, userdata, msg):
         if "control" not in st.restored:
             st.control_on = payload.upper() == "ON"
             st.restored.add("control")
-            log.info("Regelung %s (gespeichert)",
-                     "aktiv" if st.control_on else "aus")
+            log.info("Control %s (restored)",
+                     "on" if st.control_on else "off")
         return
 
     if topic == f"{BASE}/events":
         if "events" not in st.restored:
             st.restored.add("events")
             try:
-                alt = json.loads(payload).get("eintraege", [])
-                jetzt = time.time()
+                old = json.loads(payload).get("eintraege", [])
+                now_ts = time.time()
                 with st.lock:
-                    st.events = [e for e in alt
-                                 if jetzt - e.get("ts", 0) <= EVENT_MAX_AGE][-EVENT_MAX:]
-                log.info("%d frühere Ereignisse uebernommen", len(st.events))
+                    st.events = [e for e in old
+                                 if now_ts - e.get("ts", 0) <= EVENT_MAX_AGE][-EVENT_MAX:]
+                log.info("%d earlier events restored", len(st.events))
             except Exception:
                 pass
         return
@@ -1116,32 +1116,32 @@ def on_message(client, userdata, msg):
         if "shelly_ip" not in st.restored and payload:
             st.shelly_ip = payload
             st.restored.add("shelly_ip")
-            log.info("Shelly-Adresse %s (gespeichert)", payload)
+            log.info("Shelly address %s (restored)", payload)
         return
 
     if topic == f"{BASE}/shelly2/set":
-        shelly_schalten(payload.upper() == "ON", nr=2)
+        shelly_switch(payload.upper() == "ON", nr=2)
         return
 
     if topic == f"{BASE}/shelly2_ip/set":
         st.shelly2_ip = payload.strip()
         st.shelly2_fails = 0
         st.restored.add("shelly2_ip")
-        # Wie bei der ersten Adresse retained veroeffentlichen, sonst ist die
-        # Eingabe nach dem naechsten Neustart wieder weg.
+        # Publish retained like the first address, otherwise the entry is
+        # gone again after the next restart.
         client.publish(f"{BASE}/shelly2_ip", st.shelly2_ip, retain=True)
-        event(f"Nord-BKW Shelly-Adresse auf {st.shelly2_ip} geaendert")
+        event(f"North PV Shelly address changed to {st.shelly2_ip}")
         return
 
     if topic == f"{BASE}/shelly2_ip":
         if "shelly2_ip" not in st.restored and payload:
             st.shelly2_ip = payload
             st.restored.add("shelly2_ip")
-            log.info("Nord-BKW Shelly-Adresse %s (gespeichert)", payload)
+            log.info("North PV Shelly address %s (restored)", payload)
         return
 
     if topic == f"{BASE}/shelly/set":
-        shelly_schalten(payload.upper() == "ON")
+        shelly_switch(payload.upper() == "ON")
         return
 
     if topic == f"{BASE}/shelly_ip/set":
@@ -1149,11 +1149,11 @@ def on_message(client, userdata, msg):
         st.shelly_fails = 0
         st.restored.add("shelly_ip")
         client.publish(f"{BASE}/shelly_ip", payload, retain=True)
-        event(f"Shelly-Adresse auf {payload} geaendert")
+        event(f"Shelly address changed to {payload}")
         return
 
-    for key, dp, name in (("socmax", DP_SOC_MAX, "Lade-Stopp"),
-                          ("socmin", DP_SOC_MIN, "Entlade-Stopp")):
+    for key, dp, name in (("socmax", DP_SOC_MAX, "Charge stop"),
+                          ("socmin", DP_SOC_MIN, "Discharge stop")):
         if topic == f"{BASE}/{key}/set":
             val = parse_number(payload)
             if val is not None:
@@ -1162,14 +1162,14 @@ def on_message(client, userdata, msg):
                     if _dev is not None:
                         try:
                             res = _dev.set_value(int(dp), val)
-                            ok, grund = antwort_ok(res)
+                            ok, reason_txt = antwort_ok(res)
                             if ok:
                                 log_changes(st.merge({dp: val}), "(HA)")
-                                event(f"{name} auf {val} % gesetzt")
+                                event(f"{name} set to {val} %")
                             else:
-                                log.warning("%s abgelehnt: %s", name, grund)
+                                log.warning("%s rejected: %s", name, reason_txt)
                         except Exception as exc:
-                            log.error("%s setzen fehlgeschlagen: %s", name, exc)
+                            log.error("Setting %s failed: %s", name, exc)
                 publish_state()
             return
 
@@ -1177,8 +1177,8 @@ def on_message(client, userdata, msg):
         if "passthrough" not in st.restored:
             st.pass_on = payload.upper() == "ON"
             st.restored.add("passthrough")
-            log.info("Durchleitung %s (gespeichert)",
-                     "freigegeben" if st.pass_on else "gesperrt")
+            log.info("Pass-through %s (restored)",
+                     "enabled" if st.pass_on else "disabled")
         return
 
     if topic == f"{BASE}/passthrough/set":
@@ -1186,86 +1186,84 @@ def on_message(client, userdata, msg):
         st.restored.add("passthrough")
         client.publish(f"{BASE}/passthrough/state",
                        "ON" if st.pass_on else "OFF", retain=True)
-        event("Durchleitung " + ("freigegeben" if st.pass_on else "gesperrt"))
+        event("Pass-through " + ("enabled" if st.pass_on else "disabled"))
         return
 
     if topic == f"{BASE}/backflow/set":
-        sperren = payload.upper() == "ON"
-        if set_backflow(sperren, quelle="HA"):
-            event("Rueckflussverhinderung "
-                  + ("eingeschaltet - Einspeisung gesperrt" if sperren
-                     else "ausgeschaltet - Einspeisung moeglich"))
-            threading.Timer(VERIFY_DELAY, schalter_nachpruefen,
-                            (DP_BACKFLOW, sperren,
-                             "Rueckflussverhinderung")).start()
+        block = payload.upper() == "ON"
+        if set_backflow(block, source="HA"):
+            event("Backflow prevention "
+                  + ("on - export blocked" if block
+                     else "off - export possible"))
+            threading.Timer(VERIFY_DELAY, verify_switch,
+                            (DP_BACKFLOW, block,
+                             "Backflow prevention")).start()
         else:
-            event("Rueckflussverhinderung schalten fehlgeschlagen")
+            event("Switching backflow prevention failed")
         publish_state()
         return
 
     if topic == f"{BASE}/record/set":
-        an = payload.upper() == "ON"
-        if an:
+        on = payload.upper() == "ON"
+        if on:
             name = recorder.starten()
             if name:
-                event(f"Aufzeichnung gestartet: {name}")
+                event(f"Recording started: {name}")
             else:
-                # Anlaufen fehlgeschlagen - den Schalter nicht auf EIN stehen
-                # lassen, sonst zeigt das Dashboard eine Aufzeichnung an, die
-                # es nicht gibt.
-                event("Aufzeichnung konnte nicht gestartet werden")
-                an = False
+                # Starting failed - do not leave the switch on, or the
+                # dashboard shows a recording that does not exist.
+                event("Recording could not be started")
+                on = False
         else:
             name = recorder.stoppen()
             if name:
-                event(f"Aufzeichnung beendet: {name}")
-        client.publish(f"{BASE}/record/state", "ON" if an else "OFF", retain=True)
+                event(f"Recording stopped: {name}")
+        client.publish(f"{BASE}/record/state", "ON" if on else "OFF", retain=True)
         publish_record_info()
         return
 
     if topic == f"{BASE}/offgrid/set":
-        an = payload.upper() == "ON"
-        ok, grund = False, "keine Verbindung"
+        on = payload.upper() == "ON"
+        ok, reason_txt = False, "no connection"
         with _dev_lock:
             if _dev is not None:
                 try:
-                    res = _dev.set_value(int(DP_OFFGRID), an)
-                    ok, grund = antwort_ok(res)
+                    res = _dev.set_value(int(DP_OFFGRID), on)
+                    ok, reason_txt = antwort_ok(res)
                     if ok:
-                        st.merge({DP_OFFGRID: an})
+                        st.merge({DP_OFFGRID: on})
                 except Exception as exc:
-                    grund = str(exc)
+                    reason_txt = str(exc)
         if ok:
-            event("Off-Grid-Steckdose "
-                  + ("eingeschaltet" if an else "ausgeschaltet"))
-            gesperrt, soc, schwelle = offgrid_gesperrt(st.snapshot())
-            if an and gesperrt:
-                # Das Geraet nimmt den Befehl an, fuehrt ihn aber nicht aus.
-                # Ohne diesen Hinweis sieht es wie ein Fehler der Bridge aus.
-                event(f"Hinweis: Ladestand {soc} %, der Ausgang kommt erst "
-                      f"ab {schwelle} % zurueck (Entlade-Stopp "
-                      f"+{OFFGRID_SOC_MARGIN})")
-            # Der Cache steht jetzt auf dem angeforderten Wert. Ob das Geraet
-            # ihn wirklich uebernommen hat, zeigt erst ein Blick danach.
-            threading.Timer(VERIFY_DELAY, schalter_nachpruefen,
-                            (DP_OFFGRID, an, "Off-Grid-Steckdose")).start()
+            event("Off-grid socket "
+                  + ("switched on" if on else "switched off"))
+            locked, soc, threshold = offgrid_locked(st.snapshot())
+            if on and locked:
+                # The device accepts the command but does not carry it out.
+                # Without this note it looks like a bug in the bridge.
+                event(f"Note: state of charge {soc} %, the output only returns at "
+                      f"{threshold} % (discharge stop +{OFFGRID_SOC_MARGIN})")
+            # The cache now holds the requested value. Whether the device
+            # really took it only shows on a read-back.
+            threading.Timer(VERIFY_DELAY, verify_switch,
+                            (DP_OFFGRID, on, "Off-grid socket")).start()
         else:
-            # Frueher wurde das Ereignis auch bei einer Ablehnung gemeldet -
-            # im Protokoll stand dann eine Schalthandlung, die nie stattfand.
-            log.warning("Off-Grid-Steckdose abgelehnt: %s", grund)
-            event(f"Off-Grid-Steckdose schalten fehlgeschlagen: {grund}")
+            # This event used to be raised on a rejection too - the log then
+            # claimed a switching action that never happened.
+            log.warning("Off-grid socket rejected: %s", reason_txt)
+            event(f"Switching off-grid socket failed: {reason_txt}")
         publish_state()
         return
 
     if topic == f"{BASE}/charge/set":
         val = parse_number(payload)
         if val is not None:
-            # Auch den gespeicherten Sollwert mitziehen, sonst setzt der
-            # Waechter die Grenze binnen 30 s wieder zurueck.
+            # Move the stored setpoint along as well, otherwise the guard
+            # resets the limit within 30 s.
             val = max(0, min(CHARGE_HW_MAX, int(val)))
             st.tune_set("charge_limit", val)
             mqttc.publish(f"{BASE}/tune/charge_limit", val, retain=True)
-            set_charge(val, reason="manuell")
+            set_charge(val, reason="manual")
         return
 
     if topic == f"{BASE}/correction/state":
@@ -1278,20 +1276,20 @@ def on_message(client, userdata, msg):
 
     if topic == GRID_TOPIC:
         if GRID_SOURCE != "mqtt":
-            return          # HTTP-Quelle aktiv, MQTT darf sie nicht ueberschreiben
+            return          # HTTP source active, MQTT must not override it
         val = parse_number(payload, GRID_JSON_KEY)
         if val is None:
             return
-        # Dieselbe Pruefung und Sprungerkennung wie im HTTP-Pfad. Die
-        # Funktion veroeffentlicht den Wert auch selbst, sonst bliebe der
-        # Sensor "Zaehlerleistung (Regler)" in HA leer.
-        zaehlerwert_uebernehmen(val, "MQTT")
+        # Same checks and jump detection as the HTTP path. The function also
+        # publishes the value itself, otherwise the "Meter power (controller)"
+        # sensor in HA would stay empty.
+        accept_meter_value(val, "MQTT")
         return
 
     if topic == f"{BASE}/limit/set":
         val = parse_number(payload)
         if val is not None:
-            set_limit(int(val), reason="manuell")
+            set_limit(int(val), reason="manual")
         return
 
     if topic == f"{BASE}/control/set":
@@ -1299,7 +1297,7 @@ def on_message(client, userdata, msg):
         st.restored.add("control")
         client.publish(f"{BASE}/control/state",
                        "ON" if st.control_on else "OFF", retain=True)
-        event("Regelung " + ("eingeschaltet" if st.control_on else "ausgeschaltet"))
+        event("Control " + ("switched on" if st.control_on else "switched off"))
         return
 
     if topic == f"{BASE}/correction/set":
@@ -1308,11 +1306,11 @@ def on_message(client, userdata, msg):
             st.correction = int(val)
             st.restored.add("correction")
             client.publish(f"{BASE}/correction/state", st.correction, retain=True)
-            log.info("Korrekturwert = %s W", st.correction)
+            log.info("Meter target = %s W", st.correction)
 
 
 def apply_tune(key, payload, source="", echo=True):
-    """Uebernimmt einen Regelparameter, begrenzt auf den erlaubten Bereich."""
+    """Takes a controller parameter, clamped to its allowed range."""
     if key not in TUNABLES:
         return False
     name, vmin, vmax, _step, unit, typ = TUNABLES[key]
@@ -1328,24 +1326,24 @@ def apply_tune(key, payload, source="", echo=True):
 
 
 def parse_number(payload, json_key=None):
-    """Akzeptiert '812', '812.0' oder {'power': 812}.
+    """Accepts '812', '812.0' or {'power': 812}.
 
-    NaN und Infinity werden abgewiesen - ein spaeteres int() wuerde sonst
-    eine Exception werfen und den Regelschritt abbrechen.
+    NaN and infinity are rejected - a later int() would otherwise raise and
+    abort the control step.
     """
     try:
-        wert = float(payload)
-        return wert if math.isfinite(wert) else None
+        value = float(payload)
+        return value if math.isfinite(value) else None
     except ValueError:
         pass
     try:
         data = json.loads(payload)
         if json_key and isinstance(data, dict) and json_key in data:
-            wert = float(data[json_key])
-            return wert if math.isfinite(wert) else None
+            value = float(data[json_key])
+            return value if math.isfinite(value) else None
     except Exception:
         pass
-    log.warning("Unlesbarer Payload: %r", payload[:80])
+    log.warning("Unreadable payload: %r", payload[:80])
     return None
 
 
@@ -1376,38 +1374,37 @@ def connect_device():
 
 
 def antwort_ok(res):
-    """Prueft die Antwort von TinyTuya auf einen Schreibvorgang.
+    """Checks TinyTuya's reply to a write.
 
-    TinyTuya wirft bei Fehlern keine Exception, sondern liefert ein Dict mit
-    einem "Error"-Schluessel zurueck. Ohne diese Pruefung wuerde ein
-    fehlgeschlagener Befehl als erfolgreich gelten und der angeforderte Wert
-    im Cache landen - Home Assistant zeigt dann etwas an, das im Geraet nie
-    angekommen ist.
+    TinyTuya does not raise on errors; it returns a dict with on "Error" key.
+    Without this check a failed command would count as successful and the
+    requested value would land in the cache - Home Assistant would then show
+    something that never reached the device.
     """
     if res is None:
-        return False, "keine Antwort"
+        return False, "no response"
     if isinstance(res, dict) and "Error" in res:
         return False, f"{res.get('Error')} (Err {res.get('Err')})"
     return True, ""
 
 
 def write_dp(dp, watt, vmax, reason=""):
-    """Schreibt einen Leistungs-Datenpunkt, hart auf 0..vmax begrenzt."""
+    """Writes a power datapoint, hard-clamped to 0..vmax."""
     watt = max(0, min(vmax, int(watt)))
-    name = {DP_LIMIT: "Einspeisegrenze", DP_CHARGE: "Batterieladegrenze",
-            DP_PV_LIMIT: "PV-Grenze"}.get(dp, f"DP {dp}")
+    name = {DP_LIMIT: "Export limit", DP_CHARGE: "Battery charge limit",
+            DP_PV_LIMIT: "PV limit"}.get(dp, f"DP {dp}")
     with _dev_lock:
         if _dev is None:
             return False
         try:
             res = _dev.set_value(int(dp), watt)
         except Exception as exc:
-            log.error("%s schreiben fehlgeschlagen: %s", name, exc)
+            log.error("Writing %s failed: %s", name, exc)
             return False
 
-    ok, grund = antwort_ok(res)
+    ok, reason_txt = antwort_ok(res)
     if not ok:
-        log.warning("%s -> %s W abgelehnt: %s", name, watt, grund)
+        log.warning("%s -> %s W rejected: %s", name, watt, reason_txt)
         return False
 
     st.last_write = time.time()
@@ -1425,15 +1422,15 @@ def set_charge(watt, reason=""):
 
 
 def publish_record_info():
-    """Veroeffentlicht den Zustand der Aufzeichnung fuer das Dashboard."""
+    """Publishes the recording state for the dashboard."""
     i = recorder.info()
-    if i["aktiv"]:
-        text = (f"laeuft seit {i['dauer_min']} min - {i['zeilen']} Zeilen, "
-                f"{i['kb']} kB")
-    elif i["datei"]:
-        text = f"beendet: {i['datei']}"
+    if i["active"]:
+        text = (f"running for {i['minutes']} min - {i['lines']} lines, "
+                f"{i['kib']} KiB")
+    elif i["file"]:
+        text = f"stopped: {i['file']}"
     else:
-        text = "keine Aufzeichnung"
+        text = "no recording"
     i["text"] = text
     i["url"] = f"http://{REC_HOST}:{REC_PORT}/"
     mqttc.publish(f"{BASE}/record/info", json.dumps(i), retain=True)
@@ -1453,16 +1450,16 @@ def publish_state():
         out["limit"] = dps[DP_LIMIT]
     if DP_CHARGE in dps:
         out["charge"] = dps[DP_CHARGE]
-    out["soll"] = int(round(st.soll))
-    out["passthrough"] = st.pass_aktiv
-    fehler = dps.get("149")
-    fehler_text, fehler_ernst = fehler_klartext(fehler)
-    out["fault"] = fehler if isinstance(fehler, int) else 0
-    out["fault_text"] = fehler_text
-    # Eigener Wahrheitswert: Der Rohwert 2 ist ungleich null, aber harmlos.
-    # Ein Binaersensor auf den Rohwert wuerde dabei Alarm schlagen, waehrend
-    # der Text daneben "kein Fehler" anzeigt.
-    out["fault_active"] = fehler_ernst
+    out["soll"] = int(round(st.setpoint))
+    out["passthrough"] = st.pass_active
+    error = dps.get("149")
+    fault_txt, fault_serious = fault_text(error)
+    out["fault"] = error if isinstance(error, int) else 0
+    out["fault_text"] = fault_txt
+    # A separate boolean: the raw value 2 is non-zero but harmless. A binary
+    # sensor on the raw value would raise on alarm while the text next to it
+    # reads "no fault".
+    out["fault_active"] = fault_serious
     if DP_OFFGRID in dps:
         out["offgrid"] = bool(dps[DP_OFFGRID])
     if DP_BACKFLOW in dps:
@@ -1472,9 +1469,9 @@ def publish_state():
     if DP_SOC_MIN in dps:
         out["socmin"] = dps[DP_SOC_MIN]
 
-    # Restlaufzeit: nutzbare Energie oberhalb des Entlade-Stopp-SoC geteilt
-    # durch die aktuelle Entladeleistung. Nur sinnvoll, solange entladen
-    # wird - beim Laden oder im Standby bleibt der Wert leer.
+    # Remaining runtime: usable energy above the discharge-stop SoC divided by
+    # the current discharge power. Only meaningful while discharging - it stays
+    # empty when charging or in standby.
     soc = dps.get("102")
     batt = dps.get(DP_BATT)
     soc_min = dps.get("124", 0)
@@ -1490,22 +1487,22 @@ def publish_state():
 
 
 def tuya_loop():
-    """Haelt die Verbindung, mergt Delta-Frames, pollt periodisch voll."""
+    """Holds the connection, merges delta frames, polls a full status."""
     while True:
         try:
             d = connect_device()
             data = d.status()
             if not (isinstance(data, dict) and "dps" in data):
                 raise RuntimeError(f"Status fehlgeschlagen: {data}")
-            # Nach einem Reconnect zeigt der Vergleich mit dem Cache, was sich
-            # zwischenzeitlich geaendert hat - etwa durch die Oukitel-App.
-            log_changes(st.merge(data["dps"]), "(Vollstatus)")
+            # After a reconnect, comparing against the cache shows what
+            # changed meanwhile - through the Oukitel app, for instance.
+            log_changes(st.merge(data["dps"]), "(full status)")
             st.online = True
             mqttc.publish(f"{BASE}/available", "online", retain=True)
             publish_state()
-            log.info("Verbunden, %d Datenpunkte", len(data["dps"]))
+            log.info("Connected, %d datapoints", len(data["dps"]))
             if st.was_offline:
-                event("Verbindung zum Geraet wiederhergestellt")
+                event("Connection to the device restored")
                 st.was_offline = False
 
             next_hb = time.time() + HEARTBEAT
@@ -1528,7 +1525,7 @@ def tuya_loop():
                     with _dev_lock:
                         full = d.status()
                     if isinstance(full, dict) and "dps" in full:
-                        log_changes(st.merge(full["dps"]), "(Poll)")
+                        log_changes(st.merge(full["dps"]), "(poll)")
                         publish_state()
                     next_full = now + POLL_FULL
 
@@ -1536,9 +1533,9 @@ def tuya_loop():
             st.online = False
             mqttc.publish(f"{BASE}/available", "offline", retain=True)
             if not st.was_offline:
-                event(f"Verbindung zum Geraet verloren ({exc})", auch_loggen=False)
+                event(f"Connection to the device lost ({exc})", auch_loggen=False)
                 st.was_offline = True
-            log.warning("Verbindung verloren (%s), neuer Versuch in 15 s", exc)
+            log.warning("Connection lost (%s), retrying in 15 s", exc)
             time.sleep(15)
 
 
@@ -1546,65 +1543,64 @@ def tuya_loop():
 # Eco Tracker (everHome Local API)
 # --------------------------------------------------------------------------
 
-def zaehlerwert_uebernehmen(val, quelle=""):
-    """Prueft einen Zaehlerwert und uebernimmt ihn in den Zustand.
+def accept_meter_value(val, source=""):
+    """Checks a meter reading and takes it into the state.
 
-    Wird von beiden Quellen benutzt (HTTP-Abfrage und MQTT-Topic), damit der
-    Regler in beiden Faellen dieselbe Filterung sieht.
+    Used by both sources (HTTP poll and MQTT topic) so the controller sees the
+    same filtering either way.
 
-    Zwei Stufen:
-      1. Offensichtlicher Unsinn (nicht endlich, jenseits ECO_ABSURD) fliegt
-         sofort raus.
-      2. Ein Sprung groesser als ECO_SPIKE gegenueber dem letzten gueltigen
-         Wert wird erst uebernommen, wenn die naechste Messung ihn
-         bestaetigt. Ein einzelner Ausreisser wuerde den Regler sonst auf
-         Anschlag treiben.
+    Two stages:
+      1. Obvious nonsense (not finite, beyond ECO_ABSURD) is dropped straight
+         away.
+      2. A jump larger than ECO_SPIKE against the last valid reading is only
+         accepted once the next reading confirms it. A single outlier would
+         otherwise drive the controller to its limit.
 
-    Rueckgabe: True, wenn der Wert uebernommen wurde.
+    Returns True if the reading was accepted.
     """
     if not isinstance(val, (int, float)) or isinstance(val, bool):
         return False
     val = float(val)
 
     if not math.isfinite(val) or abs(val) > ECO_ABSURD:
-        log.warning("Zaehlerwert %.0f W unplausibel - verworfen%s", val,
-                    f" ({quelle})" if quelle else "")
+        log.warning("Meter reading %.0f W implausible - discarded%s", val,
+                    f" ({source})" if source else "")
         return False
 
-    meldung = None      # Ereignis, nach dem Lock abzusetzen
-    sprung = None       # gesetzt, wenn auf Bestaetigung gewartet wird
+    message = None      # Ereignis, nach dem Lock abzusetzen
+    jump = None       # set while waiting for confirmation
     with st.lock:
-        letzter = st.grid
-        verdacht = st.grid_verdacht
-        if (ECO_SPIKE and letzter is not None
-                and abs(val - letzter) > ECO_SPIKE):
-            if verdacht is None or abs(val - verdacht) > ECO_SPIKE:
-                st.grid_verdacht = val
-                sprung = letzter
+        previous = st.grid
+        suspect = st.grid_suspect
+        if (ECO_SPIKE and previous is not None
+                and abs(val - previous) > ECO_SPIKE):
+            if suspect is None or abs(val - suspect) > ECO_SPIKE:
+                st.grid_suspect = val
+                jump = previous
             else:
-                meldung = (f"Zaehlersprung bestaetigt: {letzter:+.0f} -> "
+                message = (f"Meter jump confirmed: {previous:+.0f} -> "
                            f"{val:+.0f} W")
-        elif verdacht is not None:
-            meldung = (f"Ausreisser verworfen: {verdacht:+.0f} W "
-                       f"(Zaehler blieb bei {val:+.0f} W)")
-        if sprung is None:
-            st.grid_verdacht = None
+        elif suspect is not None:
+            message = (f"Outlier discarded: {suspect:+.0f} W "
+                       f"(meter stayed at {val:+.0f} W)")
+        if jump is None:
+            st.grid_suspect = None
             st.grid = val
             st.grid_ts = time.time()
 
-    # event() nimmt selbst st.lock - deshalb erst hier, nicht im Block oben.
-    if sprung is not None:
-        log.info("Zaehlersprung %.0f -> %.0f W - warte auf Bestaetigung",
-                 sprung, val)
+    # event() takes st.lock itself - hence down here, not in the block above.
+    if jump is not None:
+        log.info("Meter jump %.0f -> %.0f W - waiting for confirmation",
+                 jump, val)
         return False
-    if meldung:
-        event(meldung, auch_loggen=False)
+    if message:
+        event(message, auch_loggen=False)
     mqttc.publish(f"{BASE}/grid", int(val))
     return True
 
 
 def eco_loop():
-    """Fragt den Eco Tracker direkt per HTTP ab - unabhaengig von HA."""
+    """Polls the Eco Tracker directly over HTTP - independent of HA."""
     fails = 0
     while True:
         try:
@@ -1615,98 +1611,98 @@ def eco_loop():
             if val is None:
                 raise ValueError(f"Feld {ECO_FIELD!r} fehlt in der Antwort")
 
-            # agePower ist das Alter des Messwerts in ms. Ein sehr alter Wert
-            # bedeutet, dass der Tracker selbst keine Daten mehr bekommt.
+            # agePower is the age of the reading in ms. A very old value means
+            # the tracker itself is no longer receiving data.
             age = data.get("agePower")
             if isinstance(age, (int, float)) and age > 30000:
-                log.warning("Eco Tracker liefert veraltete Daten (%.0f ms)", age)
+                log.warning("Eco Tracker is returning stale data (%.0f ms)", age)
                 fails += 1
                 time.sleep(ECO_INTERVAL)
                 continue
 
             val = float(val)
 
-            if not zaehlerwert_uebernehmen(val, "HTTP"):
+            if not accept_meter_value(val, "HTTP"):
                 time.sleep(ECO_INTERVAL)
                 continue
 
             if fails >= 5:
-                event("Eco Tracker wieder erreichbar", auch_loggen=False)
+                event("Eco Tracker reachable again", auch_loggen=False)
             fails = 0
 
         except Exception as exc:
             fails += 1
             if fails in (1, 5) or fails % 20 == 0:
-                log.warning("Eco Tracker nicht erreichbar (%dx): %s", fails, exc)
+                log.warning("Eco Tracker unreachable (%dx): %s", fails, exc)
                 if fails == 5:
-                    event("Eco Tracker antwortet nicht", auch_loggen=False)
+                    event("Eco Tracker is not responding", auch_loggen=False)
 
         time.sleep(ECO_INTERVAL)
 
 
 # --------------------------------------------------------------------------
-# Regelkreis
+# Control loop
 # --------------------------------------------------------------------------
 
-def shelly_rpc(ip, pfad):
-    """Ruft die RPC-Schnittstelle eines Shelly auf (Gen2/Gen3)."""
-    with urllib.request.urlopen(f"http://{ip}/rpc/{pfad}", timeout=4) as resp:
+def shelly_rpc(ip, path_):
+    """Calls a Shelly's RPC interface (Gen2/Gen3)."""
+    with urllib.request.urlopen(f"http://{ip}/rpc/{path_}", timeout=4) as resp:
         return json.loads(resp.read().decode())
 
 
 def shelly_status(ip):
-    """Liest Leistung und Schaltzustand. Gen2/Gen3 zuerst, dann Gen1."""
+    """Reads power and relay state. Gen2/Gen3 first, then Gen1."""
     try:
         d = shelly_rpc(ip, "Switch.GetStatus?id=0")
         return d.get("apower"), d.get("output")
     except Exception:
         pass
-    # Gen1: /status liefert meters[0].power und relays[0].ison
+    # Gen1: /status returns meters[0].power and relays[0].ison
     with urllib.request.urlopen(f"http://{ip}/status", timeout=4) as resp:
         d = json.loads(resp.read().decode())
-    leistung = (d.get("meters") or [{}])[0].get("power")
-    an = (d.get("relays") or [{}])[0].get("ison")
-    return leistung, an
+    power = (d.get("meters") or [{}])[0].get("power")
+    on = (d.get("relays") or [{}])[0].get("ison")
+    return power, on
 
 
-def shelly_schalten_roh(ip, an):
-    """Schaltet einen Shelly. Gen2/Gen3 zuerst, dann Gen1."""
+def shelly_switch_raw(ip, on):
+    """Switches a Shelly. Gen2/Gen3 first, then Gen1."""
     try:
-        shelly_rpc(ip, f"Switch.Set?id=0&on={'true' if an else 'false'}")
+        shelly_rpc(ip, f"Switch.Set?id=0&on={'true' if on else 'false'}")
         return
     except Exception:
         pass
-    url = f"http://{ip}/relay/0?turn={'on' if an else 'off'}"
+    url = f"http://{ip}/relay/0?turn={'on' if on else 'off'}"
     with urllib.request.urlopen(url, timeout=4):
         pass
 
 
-def shelly_abfragen(nr):
-    """Liest Leistung und Schaltzustand eines der beiden Shellys."""
+def shelly_poll(nr):
+    """Reads power and relay state of one of the two Shellys."""
     ip = st.shelly_ip if nr == 1 else st.shelly2_ip
-    name = "Shelly" if nr == 1 else "Shelly Nord-BKW"
+    name = "Shelly" if nr == 1 else "Shelly north PV"
     topic = f"{BASE}/shelly" if nr == 1 else f"{BASE}/shelly2"
     if not ip:
         return
     try:
-        leistung, an = shelly_status(ip)
+        power, on = shelly_status(ip)
         with st.lock:
             if nr == 1:
-                st.shelly_power = float(leistung) if leistung is not None else None
-                st.shelly_on = bool(an) if an is not None else None
+                st.shelly_power = float(power) if power is not None else None
+                st.shelly_on = bool(on) if on is not None else None
             else:
-                st.shelly2_power = float(leistung) if leistung is not None else None
-                st.shelly2_on = bool(an) if an is not None else None
+                st.shelly2_power = float(power) if power is not None else None
+                st.shelly2_on = bool(on) if on is not None else None
         fails = st.shelly_fails if nr == 1 else st.shelly2_fails
         if fails >= 5:
-            event(f"{name} wieder erreichbar ({ip})", auch_loggen=False)
+            event(f"{name} reachable again ({ip})", auch_loggen=False)
         if nr == 1:
             st.shelly_fails = 0
         else:
             st.shelly2_fails = 0
         mqttc.publish(topic, json.dumps({
-            "power": round(leistung) if leistung is not None else None,
-            "state": "ON" if an else "OFF",
+            "power": round(power) if power is not None else None,
+            "state": "ON" if on else "OFF",
             "ip": ip,
         }))
     except Exception as exc:
@@ -1717,44 +1713,45 @@ def shelly_abfragen(nr):
             st.shelly2_fails += 1
             fails = st.shelly2_fails
         if fails in (1, 5) or fails % 60 == 0:
-            log.warning("%s %s nicht erreichbar (%dx): %s", name, ip, fails, exc)
+            log.warning("%s %s unreachable (%dx): %s", name, ip, fails, exc)
         if fails == 5:
-            event(f"{name} {ip} antwortet nicht", auch_loggen=False)
+            event(f"{name} {ip} is not responding", auch_loggen=False)
 
 
 def shelly_loop():
     while True:
-        shelly_abfragen(1)
-        shelly_abfragen(2)
+        shelly_poll(1)
+        shelly_poll(2)
         time.sleep(SHELLY_INTERVAL)
 
 
-def shelly_schalten(an, nr=1):
-    """Schaltet einen Shelly. Trennt das jeweilige Geraet hart vom Netz."""
+def shelly_switch(on, nr=1):
+    """Switches a Shelly. Hard-disconnects that device from mains."""
     ip = st.shelly_ip if nr == 1 else st.shelly2_ip
-    name = "Shelly" if nr == 1 else "Shelly Nord-BKW"
+    name = "Shelly" if nr == 1 else "Shelly north PV"
     try:
-        shelly_schalten_roh(ip, an)
+        shelly_switch_raw(ip, on)
         with st.lock:
             if nr == 1:
-                st.shelly_on = bool(an)
+                st.shelly_on = bool(on)
             else:
-                st.shelly2_on = bool(an)
-        event(f"{name} {'eingeschaltet' if an else 'ausgeschaltet'} ({ip})")
+                st.shelly2_on = bool(on)
+        event(f"{name} {'switched on' if on else 'switched off'} ({ip})")
         return True
     except Exception as exc:
-        log.error("%s schalten fehlgeschlagen: %s", name, exc)
+        log.error("Switching %s failed: %s", name, exc)
         return False
 
 
 def offgrid_watch_loop():
-    """Meldet, solange der Ladestand den Off-Grid-Ausgang blockiert.
+    """Reports for as long as the state of charge locks out the off-grid
+    output.
 
-    Es gibt keinen Datenpunkt, der den tatsaechlichen Zustand der Steckdose
-    verraet - DP 135 meldet durchgehend rund 235 V, unabhaengig davon, ob am
-    Ausgang etwas anliegt. Die einzige belastbare Aussage ist deshalb die
-    Sperre: unterhalb von Entlade-Stopp plus OFFGRID_SOC_MARGIN gibt das
-    Geraet den Ausgang nicht frei, egal was DP 119 sagt.
+    No datapoint reveals the socket's actual state - DP 135 reports about
+    235 V throughout, whether or not anything is present at the output. The
+    lockout is therefore the only statement that holds up: below the discharge
+    stop plus OFFGRID_SOC_MARGIN the device will not release the output, no
+    matter what DP 119 says.
     """
     while True:
         time.sleep(20)
@@ -1762,179 +1759,178 @@ def offgrid_watch_loop():
             continue
         dps = st.snapshot()
         if not dps.get(DP_OFFGRID):
-            continue                      # nicht freigegeben, nichts zu melden
-        gesperrt, soc, schwelle = offgrid_gesperrt(dps)
-        if gesperrt and not st.offgrid_gemeldet:
-            st.offgrid_gemeldet = True
-            event(f"Off-Grid-Ausgang freigegeben, aber gesperrt: Ladestand "
-                  f"{soc} %, das Geraet gibt ihn erst ab {schwelle} % frei")
-        elif not gesperrt and st.offgrid_gemeldet:
-            st.offgrid_gemeldet = False
-            event(f"Off-Grid-Ausgang wieder freigegeben (Ladestand {soc} %)")
+            continue                      # not enabled, nothing to report
+        locked, soc, threshold = offgrid_locked(dps)
+        if locked and not st.offgrid_reported:
+            st.offgrid_reported = True
+            event(f"Off-grid output enabled but locked out: state of charge "
+                  f"{soc} %, the device releases it at {threshold} %")
+        elif not locked and st.offgrid_reported:
+            st.offgrid_reported = False
+            event(f"Off-grid output released again (state of charge {soc} %)")
 
 
 def charge_guard_loop():
-    """Haelt die Batterieladegrenze (DP 122) auf dem eingestellten Wert.
+    """Holds the battery charge limit (DP 122) at the configured value.
 
-    DP 122 begrenzt die Ladeleistung der Batterie insgesamt - aus PV *und*
-    aus dem Netz. Steht der Wert auf 0, schaltet das Geraet die MPPT-Regler
-    ab und nimmt gar keinen Solarstrom mehr auf, auch bei leerem Akku und
-    voller Sonne. Der Wert muss deshalb dauerhaft oben stehen.
+    DP 122 caps the battery's total charge power - from PV *and* from the
+    grid. At 0 the device switches its MPPT controllers off and takes in no
+    solar power at all, even on on empty battery in full sun. The value must
+    therefore stay up permanently.
 
-    DP 118 (Rueckflussverhinderung) sperrt uebrigens die Einspeisung ins
-    Netz, nicht das Laden aus dem Netz - der Name ist irrefuehrend.
+    Incidentally, DP 118 (backflow prevention) blocks export to the grid, not
+    charging from the grid - the name is misleading.
     """
     while True:
         time.sleep(30)
         if not st.online:
             continue
-        soll = st.tune["charge_limit"]
-        ist = st.snapshot().get(DP_CHARGE)
-        if isinstance(ist, int) and ist != soll:
-            log.info("Batterieladegrenze steht auf %s W statt %s W - korrigiert",
-                     ist, soll)
-            set_charge(soll, reason="Freigabe PV-Ladung")
+        setpoint = st.tune["charge_limit"]
+        actual = st.snapshot().get(DP_CHARGE)
+        if isinstance(actual, int) and actual != setpoint:
+            log.info("Battery charge limit is %s W instead of %s W - corrected",
+                     actual, setpoint)
+            set_charge(setpoint, reason="re-enable PV charging")
 
 
 def set_pv_limit(watt, reason=""):
-    """Schreibt DP 156, die PV-Ladeleistung.
+    """Writes DP 156, the PV charge power.
 
-    Damit laesst sich die Solarseite drosseln, ohne die Einspeisung
-    anzutasten. Achtung: Das Geraet fuehrt diesen Wert auch selbst nach,
-    wenn in der App ein PV-Zeitplan hinterlegt ist.
+    This throttles the solar side without touching the export limit. Careful:
+    the device also adjusts this value on its own if a PV schedule is
+    configured in the app.
     """
     return write_dp(DP_PV_LIMIT, watt, 4000, reason)
 
 
-def offgrid_gesperrt(dps):
-    """Prueft, ob der Ladestand den Off-Grid-Ausgang blockiert.
+def offgrid_locked(dps):
+    """Checks whether the state of charge locks out the off-grid output.
 
-    Rueckgabe: (gesperrt, ladestand, schwelle). Ohne brauchbare Werte gilt
-    nichts als gesperrt - lieber keine Meldung als eine falsche.
+    Returns (locked, state_of_charge, threshold). Without usable values
+    nothing counts as locked - better no report than a wrong one.
     """
     soc = dps.get("102")
     soc_min = dps.get(DP_SOC_MIN)
     if not isinstance(soc, (int, float)) or not isinstance(soc_min, (int, float)):
         return False, soc, None
-    schwelle = soc_min + OFFGRID_SOC_MARGIN
-    return soc < schwelle, soc, schwelle
+    threshold = soc_min + OFFGRID_SOC_MARGIN
+    return soc < threshold, soc, threshold
 
 
-def geraet_status_lesen():
-    """Holt einen Vollstatus und uebernimmt ihn. Rueckgabe: dps oder None."""
+def read_device_status():
+    """Fetches a full status and merges it. Returns dps, or None."""
     with _dev_lock:
         if _dev is None:
             return None
         try:
             data = _dev.status()
         except Exception as exc:
-            log.warning("Statusabfrage fehlgeschlagen: %s", exc)
+            log.warning("Status query failed: %s", exc)
             return None
     if not (isinstance(data, dict) and "dps" in data):
         return None
-    log_changes(st.merge(data["dps"]), "(Nachpruefung)")
+    log_changes(st.merge(data["dps"]), "(verify)")
     return data["dps"]
 
 
-def schalter_nachpruefen(dp, erwartet, name):
-    """Liest nach einem Schaltbefehl nach, ob das Geraet ihn umgesetzt hat.
+def verify_switch(dp, expected, name):
+    """Reads back whether the device carried out a switch command.
 
-    Das Geraet quittiert Befehle auch dann mit OK, wenn es sie anschliessend
-    nicht ausfuehrt oder sofort wieder zuruecknimmt. Ohne Nachpruefung stuende
-    der angeforderte Wert im Cache und damit in Home Assistant, waehrend am
-    Geraet etwas anderes anliegt - genau der Fall, der am 11.09. auffiel:
-    Steckdose am Geraet aus, in HA an.
+    The device acknowledges commands with OK even when it then does not
+    execute them or reverts immediately. Without the read-back the requested
+    value would sit in the cache and therefore in Home Assistant while
+    something else is true at the device - exactly the case seen on 11.09.:
+    socket off at the device, on in HA.
     """
-    dps = geraet_status_lesen()
+    dps = read_device_status()
     if dps is None or dp not in dps:
         return
-    ist = bool(dps[dp])
-    if ist != bool(erwartet):
-        event(f"{name}: Geraet meldet "
-              f"{'ein' if ist else 'aus'}, angefordert war "
-              f"{'ein' if erwartet else 'aus'} - Anzeige korrigiert")
+    actual = bool(dps[dp])
+    if actual != bool(expected):
+        event(f"{name}: device reports "
+              f"{'on' if actual else 'off'}, requested was "
+              f"{'on' if expected else 'off'} - display corrected")
     publish_state()
 
 
-def set_backflow(sperren, quelle=""):
-    """Schaltet die Rueckflussverhinderung (DP 118).
+def set_backflow(block, source=""):
+    """Switches backflow prevention (DP 118).
 
-    Der Name meint den Rueckfluss *ins Netz*: Eingeschaltet sperrt sie die
-    Einspeisung vollstaendig, das Geraet geht in den Standby. Auf das Laden
-    aus dem Netz hat sie keinen Einfluss.
+    The name refers to backflow *into the grid*: switched on it blocks export
+    entirely and the device goes to standby. It has no effect on charging
+    from the grid.
     """
     with _dev_lock:
         if _dev is None:
             return False
         try:
-            res = _dev.set_value(int(DP_BACKFLOW), bool(sperren))
+            res = _dev.set_value(int(DP_BACKFLOW), bool(block))
         except Exception as exc:
-            log.error("Rueckflussverhinderung schalten fehlgeschlagen: %s", exc)
+            log.error("Switching backflow prevention failed: %s", exc)
             return False
-    ok, grund = antwort_ok(res)
+    ok, reason_txt = antwort_ok(res)
     if not ok:
-        log.warning("Rueckflussverhinderung abgelehnt: %s", grund)
+        log.warning("Backflow prevention rejected: %s", reason_txt)
         return False
-    st.merge({DP_BACKFLOW: bool(sperren)})
-    log.info("Einspeisung %s%s", "gesperrt" if sperren else "freigegeben",
-             f" ({quelle})" if quelle else "")
+    st.merge({DP_BACKFLOW: bool(block)})
+    log.info("Export %s%s", "blocked" if block else "allowed",
+             f" ({source})" if source else "")
     return True
 
 
-# Bits des Systemfehlerregisters DP 149. Die App zeigt nur die nackte Zahl
-# an und beschriftet sie mit "Systemfehler". Bit 7 ist durch einen Versuch
-# belegt: eine gezielt erzeugte Ueberlast am AC-Ausgang setzte den Wert auf
-# 128, das Geraet warf die Netzseite ab, und der Wert blieb stehen, bis das
-# Geraet neu gestartet wurde.
+# Bits of the DP 149 system fault register. The app shows nothing but the bare
+# number, labelled "system fault". Bit 7 is pinned down by on experiment: a
+# deliberately induced overload on the AC output set the value to 128, the
+# device dropped the grid side, and the value stayed put until the device was
+# restarted.
 #
-# Dass es sich um ein Bitfeld handelt, ist eine begruendete Vermutung und
-# nicht bewiesen: bisher wurden nur 2 und 128 beobachtet, beides Zweier-
-# potenzen. Ein kombinierter Wert wie 130 waere der Beweis. Unbekannte Bits
-# werden deshalb einzeln und ehrlich als solche ausgewiesen.
-# Schluessel ist jeweils der Bitwert, nicht die Bitnummer.
+# That this is a bit field is on educated guess, not a proven fact: only 2 and
+# 128 have been observed, both powers of two. A combined value such as 130
+# would settle it. Unknown bits are therefore reported individually and
+# honestly as unknown.
+# Keys are bit values, not bit numbers.
 FEHLER_BITS = {
-    128: "Ueberlast am AC-Ausgang",   # Bit 7
+    128: "AC output overload",   # Bit 7
 }
-# Bits, die im ungestoerten Betrieb auftreten und keine Stoerung sind.
+# Bits that occur in undisturbed operation and are not faults.
 FEHLER_HARMLOS = {2}                  # Bit 1, wechselt zusammen mit 101/114
 
 
-def fehler_klartext(wert):
-    """Zerlegt DP 149 in die gesetzten Bits.
+def fault_text(value):
+    """Breaks DP 149 down into the bits that are set.
 
-    Rueckgabe: (Text, ernst). ``ernst`` ist False, solange nur als harmlos
-    bekannte Bits gesetzt sind - sonst wuerde das normale Flackern des
-    Registers dauernd Alarm ausloesen.
+    Returns (text, serious). ``serious`` is False as long as only bits known
+    to be harmless are set - otherwise the register's normal flicker would
+    raise on alarm constantly.
     """
-    if not isinstance(wert, int) or wert == 0:
-        return "kein Fehler", False
-    teile, ernst = [], False
+    if not isinstance(value, int) or value == 0:
+        return "no fault", False
+    parts, serious = [], False
     for bit in range(16):
-        maske = 1 << bit
-        if not wert & maske:
+        mask = 1 << bit
+        if not value & mask:
             continue
-        if maske in FEHLER_HARMLOS:
+        if mask in FEHLER_HARMLOS:
             continue
-        ernst = True
-        teile.append(FEHLER_BITS.get(maske,
-                                     f"unbekanntes Bit {bit} ({maske})"))
-    if not teile:
-        return "kein Fehler", False
-    return ", ".join(teile), ernst
+        serious = True
+        parts.append(FEHLER_BITS.get(mask,
+                                     f"unknown bit {bit} ({mask})"))
+    if not parts:
+        return "no fault", False
+    return ", ".join(parts), serious
 
 
 def control_loop():
-    """Regelt die Einspeisung ueber DP 121.
+    """Controls export through DP 121.
 
-    Nur eine Richtung: Ist am Zaehler Bezug vorhanden, gibt das Geraet mehr
-    ab; ist Ueberschuss da, wird die Einspeisegrenze zurueckgenommen und die
-    PV laedt automatisch den Akku. Ein Stellglied fuer die Ladeleistung
-    braucht es dafuer nicht - DP 122 bleibt dauerhaft offen, siehe
-    charge_guard_loop().
+    One direction only: if the meter shows import, the device gives more; if
+    there is surplus, the export limit is pulled back and PV charges the
+    battery by itself. No actuator for charge power is needed for that -
+    DP 122 stays open permanently, see charge_guard_loop().
 
-    Oberhalb von "Durchleitung ab SoC" uebernimmt ein zweiter, voellig
-    anderer Zweig: dort wird nicht mehr auf den Zaehler geregelt, sondern der
-    Ladestand gehalten und konstant eingespeist. Siehe die Kommentare dort.
+    Above "Pass-through from SoC" a second, entirely different branch takes
+    over: it no longer regulates against the meter but holds the state of
+    charge and exports a constant figure. See the comments there.
     """
     while True:
         time.sleep(st.tune["interval"])
@@ -1948,139 +1944,138 @@ def control_loop():
             continue
 
         # ------------------------------------------------------------------
-        # Durchleitung
+        # Pass-through
         # ------------------------------------------------------------------
-        # Ziel: Der Ladestand bleibt stehen und das Geraet speist konstant
-        # LIMIT_MAX ins Hausnetz. Weil PV beim EP2500 immer ueber den Akku
-        # laeuft, heisst das schlicht: PV-Ladeleistung so einstellen, dass
-        # sie die Einspeisung deckt. Zwei feste Werte, keine Bilanzregelung.
+        # Goal: the state of charge stays put and the device exports a
+        # constant LIMIT_MAX into the house. Because PV always runs through
+        # the battery on the EP2500, that simply means setting the PV charge
+        # power so it covers the export. Two fixed values, no balance loop.
         #
-        # Nachgefuehrt wird nur der Wandlungsverlust, und zwar am Ladestand.
-        # Der Verlust wirkt in die sichere Richtung: 800 W in den Akku ergeben
-        # am Ausgang weniger als 800 W, der Ladestand sinkt also von selbst
-        # leicht ab. Ueberschreitungen sind damit die Ausnahme, nicht die
-        # Regel - deshalb genuegt ein kleiner Schritt alle paar Minuten.
+        # Only the conversion loss is trimmed, and it is trimmed against the
+        # state of charge. The loss works in the safe direction: 800 W into
+        # the battery yields less than 800 W at the output, so the state of
+        # charge drifts down on its own. Overshoots are the exception rather
+        # than the rule - hence one small step every few minutes is enough.
         soc = dps.get("102")
-        ziel = st.tune["soc_pass"]
+        target = st.tune["soc_pass"]
         if st.pass_on and isinstance(soc, (int, float)):
-            # Hysterese: einmal aktiv, bleibt es bis PASS_HYST unter dem Ziel
-            grenze = ziel - PASS_HYST if st.pass_aktiv else ziel
-            aktiv = soc >= grenze
+            # Hysteresis: once active it stays until PASS_HYST below target
+            grenze = target - PASS_HYST if st.pass_active else target
+            active = soc >= grenze
         else:
-            aktiv = False
+            active = False
 
-        if aktiv != st.pass_aktiv:
-            st.pass_aktiv = aktiv
-            if aktiv:
+        if active != st.pass_active:
+            st.pass_active = active
+            if active:
                 st.pass_next = time.time() + PASS_SETTLE
-                event(f"Durchleitung aktiv - halte Ladestand bei {ziel} %, "
-                      f"{LIMIT_MAX} W ins Hausnetz")
-                set_limit(LIMIT_MAX, reason="Durchleitung")
-                st.soll = float(LIMIT_MAX)
-                # Auch hier gilt: den Merker nur bei erfolgreichem Schreiben
-                # fortschreiben. Wird der Befehl abgelehnt, stuende sonst
-                # gleich zu Beginn ein Wert im Regler, den das Geraet nie
-                # bekommen hat.
-                if set_pv_limit(LIMIT_MAX, reason="Durchleitung"):
-                    st.pass_pv_soll = LIMIT_MAX
+                event(f"Pass-through active - holding state of charge at {target} %, "
+                      f"{LIMIT_MAX} W into the house")
+                set_limit(LIMIT_MAX, reason="pass-through")
+                st.setpoint = float(LIMIT_MAX)
+                # Same rule here: only advance the marker on a successful
+                # write. If the command is rejected, the controller would
+                # otherwise start out holding a value the device never got.
+                if set_pv_limit(LIMIT_MAX, reason="pass-through"):
+                    st.pass_pv_setpoint = LIMIT_MAX
                 else:
                     st.pass_next = time.time() + PASS_ADJUST_FAST
             else:
-                event("Durchleitung beendet - zurueck auf Nulleinspeisung")
-                # PV-Grenze wieder ganz oeffnen, sonst bleibt die Ernte
-                # gedrosselt. Schlaegt das fehl, muss es wiederholt werden -
-                # sonst bleibt die Solarseite dauerhaft abgeregelt, ohne dass
-                # es jemand merkt. Genau das ist am 09.09. um 14:32 passiert.
+                event("Pass-through ended - back to zero-export control")
+                # Open the PV limit fully again, otherwise the harvest stays
+                # throttled. If that fails it has to be retried - otherwise
+                # the solar side stays curtailed indefinitely without anyone
+                # noticing. Exactly what happened on 09.09. at 14:32.
                 if not set_pv_limit(st.tune["pv_max"],
-                                    reason="Durchleitung beendet"):
+                                    reason="pass-through ended"):
                     st.pv_reopen = True
             publish_state()
 
-        # Nachholen, falls das Oeffnen der PV-Grenze beim Beenden fehlschlug.
-        if st.pv_reopen and not aktiv:
+        # Catch up if reopening the PV limit failed when pass-through ended.
+        if st.pv_reopen and not active:
             if set_pv_limit(st.tune["pv_max"],
-                            reason="Durchleitung beendet (Wiederholung)"):
+                            reason="pass-through ended (retry)"):
                 st.pv_reopen = False
                 publish_state()
 
-        if aktiv:
-            # Die Einspeisegrenze steht fest. Falls sie jemand anders
-            # verstellt hat (App, abgelehntes Kommando), zurueckholen.
+        if active:
+            # The export limit is fixed. If something else moved it (the app,
+            # a rejected command), put it back.
             if isinstance(limit, int) and limit != LIMIT_MAX:
-                log.info("Durchleitung | Einspeisegrenze steht auf %s W "
-                         "statt %s W - korrigiert", limit, LIMIT_MAX)
-                set_limit(LIMIT_MAX, reason="Durchleitung: Grenze halten")
-                st.soll = float(LIMIT_MAX)
+                log.info("Pass-through | export limit is %s W instead of %s W - "
+                         "corrected", limit, LIMIT_MAX)
+                set_limit(LIMIT_MAX, reason="pass-through: hold limit")
+                st.setpoint = float(LIMIT_MAX)
                 publish_state()
 
             if time.time() < st.pass_next:
                 continue
 
-            abweichung = int(soc) - ziel
-            if abweichung == 0:
-                # Ladestand sitzt auf dem Ziel - nichts tun.
+            deviation = int(soc) - target
+            if deviation == 0:
+                # State of charge is on target - do nothing.
                 st.pass_next = time.time() + PASS_ADJUST
                 continue
 
-            # Schrittweite proportional zur Abweichung. Wichtig ist die
-            # Symmetrie: runter und rauf gleich schnell. Ein schnelles
-            # Absenken mit langsamem Zurueckholen wuerde den Ladestand bei
-            # jeder Wolke weiter nach unten treiben.
-            schritt = max(-PASS_STEP_FAST,
-                          min(PASS_STEP_FAST, -abweichung * PASS_STEP))
-            wartezeit = (PASS_ADJUST_FAST if abs(abweichung) >= PASS_ALARM
+            # Step size proportional to the deviation. The symmetry matters:
+            # down and up at the same rate. Lowering fast and recovering
+            # slowly would drive the state of charge further down with every
+            # passing cloud.
+            step = max(-PASS_STEP_FAST,
+                          min(PASS_STEP_FAST, -deviation * PASS_STEP))
+            wait = (PASS_ADJUST_FAST if abs(deviation) >= PASS_ALARM
                          else PASS_ADJUST)
-            st.pass_next = time.time() + wartezeit
+            st.pass_next = time.time() + wait
 
-            # Batterie-Gate: nicht weiter verstellen, wenn die Batterie
-            # bereits in die gewuenschte Richtung arbeitet. Der Ladestand
-            # hinkt der Leistung um Minuten hinterher. Ohne diese Bremse
-            # schiebt der Regler waehrend der Nachlaufzeit weiter nach und
-            # schiesst weit ueber das Ziel hinaus - genau so ist der
-            # PV-Sollwert einmal von 725 auf 0 gelaufen, obwohl die Ladung
-            # schon fast stand.
+            # Battery gate: stop adjusting once the battery is already
+            # working in the desired direction. The state of charge lags the
+            # power by minutes. Without this brake the controller keeps
+            # pushing during the lag and overshoots badly - that is how the PV
+            # setpoint once ran from 725 down to 0 while charging had already
+            # almost stopped.
             #
-            # Die Batterieleistung ist hier nur eine Vorzeichenpruefung, keine
-            # Regelgroesse. Ihre Verzoegerung von 20 bis 70 s faellt bei einem
-            # Takt von 45 s und mehr nicht ins Gewicht.
+            # Battery power is only a sign check here, not a control variable.
+            # Its 20 to 70 s delay does not matter at a cadence of 45 s or
+            # more.
             batt = dps.get(DP_BATT)
-            soll_batt = -abweichung * PASS_BATT_BIAS
+            target_batt = -deviation * PASS_BATT_BIAS
             if isinstance(batt, (int, float)):
-                if schritt < 0 and batt <= soll_batt:
+                if step < 0 and batt <= target_batt:
                     continue
-                if schritt > 0 and batt >= soll_batt:
+                if step > 0 and batt >= target_batt:
                     continue
 
-            # Anti-Windup: Nach oben nur nachfuehren, wenn die Grenze
-            # ueberhaupt wirkt. Liefert die PV weniger als erlaubt, ist die
-            # Wolke die Ursache und nicht die Einstellung - den Sollwert dann
-            # weiter hochzudrehen aendert nichts, und bei der naechsten
-            # Aufklarung schiesst der Ladestand ueber.
-            pv_ist = dps.get("143")
-            if (schritt > 0 and isinstance(pv_ist, (int, float))
-                    and pv_ist < st.pass_pv_soll - PASS_STEP):
+            # Anti-windup: only raise the setpoint when the limit is actually
+            # the binding constraint. If PV delivers less than allowed, the
+            # cloud is the cause and not the setting - turning it up further
+            # changes nothing, and the state of charge would overshoot the
+            # moment the sun returns.
+            pv_actual = dps.get("143")
+            if (step > 0 and isinstance(pv_actual, (int, float))
+                    and pv_actual < st.pass_pv_setpoint - PASS_STEP):
                 continue
 
-            obergrenze = min(PASS_PV_CAP, st.tune["pv_max"])
-            neu = max(0, min(obergrenze, st.pass_pv_soll + schritt))
-            if neu == st.pass_pv_soll:
+            ceiling = min(PASS_PV_CAP, st.tune["pv_max"])
+            new = max(0, min(ceiling, st.pass_pv_setpoint + step))
+            if new == st.pass_pv_setpoint:
                 continue
-            log.info("Durchleitung | SoC %s %% (Ziel %s) | Akku %s W | "
-                     "PV-Ladeleistung %s -> %s W",
-                     soc, ziel, batt, st.pass_pv_soll, neu)
-            if set_pv_limit(neu, reason="Durchleitung: Ladestand halten"):
-                st.pass_pv_soll = neu
+            log.info("Pass-through | SoC %s %% (target %s) | battery %s W | "
+                     "PV charge power %s -> %s W",
+                     soc, target, batt, st.pass_pv_setpoint, new)
+            if set_pv_limit(new, reason="pass-through: hold SoC"):
+                st.pass_pv_setpoint = new
                 publish_state()
             else:
-                # Abgelehnt: Das Geraet hat den Wert nicht uebernommen. Den
-                # Merker stehen lassen, sonst rechnet der Regler ab jetzt von
-                # einem Wert weiter, der nie gesetzt wurde, und seine Annahme
-                # laeuft von der Wirklichkeit weg. Bald nochmal versuchen.
+                # Rejected: the device did not take the value. Leave the
+                # marker alone, otherwise the controller would carry on from a
+                # figure that was never set and its assumption would drift
+                # away from reality. Retry soon.
                 st.pass_next = time.time() + PASS_ADJUST_FAST
             continue
 
-        # Ab hier nur noch die Nulleinspeisung. Sie braucht den Zaehler, die
-        # Durchleitung oben nicht - deshalb steht sie vor dieser Pruefung.
+        # From here on it is zero-export control only. That needs the meter;
+        # pass-through above does not - which is why it sits before this
+        # check.
         with st.lock:
             grid = st.grid
             grid_age = time.time() - st.grid_ts
@@ -2089,91 +2084,91 @@ def control_loop():
         if grid is None or grid_age > GRID_MAX_AGE:
             if not st.grid_fail:
                 st.grid_fail = True
-                event(f"Zaehler liefert keine Werte - Einspeisegrenze auf "
+                event(f"Meter is not reporting - export limit set to "
                       f"{GRID_FAIL_LIMIT} W")
-                # Ohne Zaehlerwert kann nicht geregelt werden. Die zuletzt
-                # gesetzte Grenze einfach stehen zu lassen hiesse, blind
-                # weiterzuspeisen.
-                set_limit(GRID_FAIL_LIMIT, reason="Zaehlerausfall")
-                st.soll = float(GRID_FAIL_LIMIT)
+                # Without a meter reading there is nothing to control
+                # against. Simply leaving the last limit in place would mean
+                # exporting blind.
+                set_limit(GRID_FAIL_LIMIT, reason="meter failure")
+                st.setpoint = float(GRID_FAIL_LIMIT)
                 publish_state()
             continue
         if st.grid_fail:
             st.grid_fail = False
-            event("Zaehler liefert wieder Werte - Regelung aktiv")
+            event("Meter is reporting again - control active")
 
         ac_out = dps.get(DP_AC_OUT)
         status = dps.get("134")
 
-        ist = float(ac_out) if isinstance(ac_out, (int, float)) else 0.0
-        fehler = grid - target          # >0 = Netzbezug, Geraet muss mehr abgeben
+        actual = float(ac_out) if isinstance(ac_out, (int, float)) else 0.0
+        error = grid - target          # >0 = importing, device must give more
 
-        # Leerlauf-Sperre: Nur wenn tatsaechlich Leistung angefordert wurde
-        # und trotzdem nichts kommt (leerer Akku). Steht die Grenze auf 0,
-        # weil der Regler sie selbst dorthin gesetzt hat, darf nicht
-        # pausiert werden - sonst faehrt er nie wieder an.
-        leerlauf = (ist_standby(status) and ist == 0.0 and limit >= 20
-                    and fehler > 0)
-        if leerlauf:
+        # Idle lock: only when power was actually requested and nothing comes
+        # out anyway (empty battery). If the limit is at 0 because the
+        # controller put it there itself, do not pause - otherwise it would
+        # never start up again.
+        idle = (is_standby(status) and actual == 0.0 and limit >= 20
+                    and error > 0)
+        if idle:
             if not st.idle_logged:
-                event("Regelung pausiert - Geraet im Standby, "
-                      f"Akku {dps.get('102', '?')} %")
+                event("Control paused - device in standby, "
+                      f"battery {dps.get('102', '?')} %")
                 st.idle_logged = True
             st.idle_since = time.time()
             continue
         if st.idle_logged:
-            # Erst wieder anlaufen, wenn das Geraet IDLE_HOLD am Stueck
-            # ausserhalb des Standby war. Ein kurzes Aufblitzen reicht nicht -
-            # sonst wechselt die Regelung im Minutentakt zwischen pausiert
-            # und aktiv und schreibt das Ereignisprotokoll voll.
+            # Only resume once the device has been out of standby for
+            # IDLE_HOLD without interruption. A brief flicker is not enough -
+            # otherwise control alternates between paused and active every
+            # minute and fills the event log.
             if time.time() - st.idle_since < IDLE_HOLD:
                 continue
-            event("Regelung wieder aktiv - Geraet reagiert")
+            event("Control resumed - device responding")
             st.idle_logged = False
 
-        if abs(fehler) <= st.tune["deadband"]:
+        if abs(error) <= st.tune["deadband"]:
             continue
 
-        # Anti-Windup: Der Sollwert darf nicht ueber das hinauslaufen, was das
-        # Geraet tatsaechlich schafft. Liefert die PV nur 300 W, waere ein
-        # Sollwert von 800 W eine Zahl ohne Wirkung, die beim naechsten
-        # Aufklaren schlagartig wirksam wuerde.
+        # Anti-windup: the setpoint must not run beyond what the device can
+        # actually deliver. If PV only yields 300 W, a setpoint of 800 W is a
+        # number without effect that would take hold abruptly the moment the
+        # sun returns.
         #
-        # Nur nach oben klammern. Eine untere Klammer (soll mindestens
-        # ist - Marge) hat hier lange Schaden angerichtet: DP 155 kommt im
-        # Abstand von etwa 20 s, der Regler laeuft alle paar Sekunden. Direkt
-        # nach einer Absenkung zeigt "ist" noch den alten, hohen Ausgang, und
-        # die untere Klammer hob die gerade vorgenommene Korrektur wieder auf.
-        # Beobachtet: bei -15 W Zaehlerabweichung sprang der Sollwert von 432
-        # auf 720 W, weil "ist" noch auf 795 W stand.
-        soll = min(ist + WINDUP_MARGIN, st.soll)
+        # Clamp upwards only. A lower clamp (setpoint at least actual minus
+        # margin) did damage here for a long time: DP 155 arrives roughly
+        # every 20 s while the controller runs every few seconds. Right after
+        # a reduction, "actual" still shows the old, high output, and the
+        # lower clamp undid the correction that had just been made. Observed:
+        # at a meter deviation of -15 W the setpoint jumped from 432 to 720 W
+        # because "actual" still read 795 W.
+        setpoint = min(actual + WINDUP_MARGIN, st.setpoint)
 
         max_step = st.tune["max_step"]
-        soll += max(-max_step, min(max_step, fehler * st.tune["gain"]))
-        soll = max(0.0, min(float(LIMIT_MAX), soll))
-        st.soll = soll
+        setpoint += max(-max_step, min(max_step, error * st.tune["gain"]))
+        setpoint = max(0.0, min(float(LIMIT_MAX), setpoint))
+        st.setpoint = setpoint
 
-        neu = int(round(soll))
-        if abs(neu - limit) < CTRL_MIN_STEP:
+        new = int(round(setpoint))
+        if abs(new - limit) < CTRL_MIN_STEP:
             continue
 
-        log.info("Zaehler %+.0f W (Ziel %+d) | Ist %.0f W | Einspeisen %s -> %s",
-                 grid, target, ist, limit, neu)
-        set_limit(neu, reason="Regelung")
+        log.info("Meter %+.0f W (target %+d) | actual %.0f W | export %s -> %s",
+                 grid, target, actual, limit, new)
+        set_limit(new, reason="control")
         publish_state()
 
 
 def main():
-    fehlend = [n for n, v in (("EP2500_ID", DEVICE_ID),
+    missing = [n for n, v in (("EP2500_ID", DEVICE_ID),
                               ("EP2500_IP", DEVICE_IP),
                               ("EP2500_KEY", LOCAL_KEY)) if not v]
-    if fehlend:
-        log.error("Bitte %s in der Umgebung setzen (siehe README).",
-                  ", ".join(fehlend))
+    if missing:
+        log.error("Please set %s in the environment (see README).",
+                  ", ".join(missing))
         raise SystemExit(1)
 
-    # connect_async blockiert nicht: die Bridge startet auch dann, wenn der
-    # Broker noch nicht erreichbar ist, und verbindet sich spaeter selbst.
+    # connect_async does not block: the bridge starts even when the broker is
+    # not reachable yet and connects itself later.
     mqttc.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
     mqttc.loop_start()
 
@@ -2186,26 +2181,26 @@ def main():
     threading.Thread(target=record_info_loop, daemon=True).start()
 
     if GRID_SOURCE == "http":
-        log.info("Zaehlerquelle: HTTP %s (Feld %s)", ECO_URL, ECO_FIELD)
+        log.info("Meter source: HTTP %s (field %s)", ECO_URL, ECO_FIELD)
         threading.Thread(target=eco_loop, daemon=True).start()
     else:
-        log.info("Zaehlerquelle: MQTT %s", GRID_TOPIC)
+        log.info("Meter source: MQTT %s", GRID_TOPIC)
 
-    beenden = threading.Event()
+    shutdown_evt = threading.Event()
 
-    def stoppen(signum, frame):
-        log.info("Signal %s empfangen", signum)
-        beenden.set()
+    def handle_signal(signum, frame):
+        log.info("Signal %s received", signum)
+        shutdown_evt.set()
 
-    # docker stop schickt SIGTERM - ohne Behandlung liefe das Aufraeumen nie.
-    signal.signal(signal.SIGTERM, stoppen)
-    signal.signal(signal.SIGINT, stoppen)
+    # docker stop sends SIGTERM - without handling it, cleanup never runs.
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
-    beenden.wait()
+    shutdown_evt.wait()
 
-    log.info("Beende, setze Einspeisegrenze auf %s W", LIMIT_SAFE)
-    if st.pass_aktiv:
-        # Eine von der Durchleitung gesetzte PV-Drosselung wieder oeffnen
+    log.info("Shutting down, setting export limit to %s W", LIMIT_SAFE)
+    if st.pass_active:
+        # Reopen any PV throttling that pass-through left in place
         set_pv_limit(st.tune["pv_max"], reason="Shutdown")
     set_limit(LIMIT_SAFE, reason="Shutdown")
     mqttc.publish(f"{BASE}/available", "offline", retain=True)

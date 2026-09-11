@@ -111,3 +111,29 @@ welcome contribution.
 MIT – see [LICENSE](LICENSE).
 
 Not affiliated with Oukitel or Shenzhen Yunji New Energy Technology.
+
+## Upgrading from a German-language version
+
+Everything the bridge publishes is now in English: entity names, log lines and
+events. If you ran an earlier build, be aware of what that does and does not
+change in Home Assistant.
+
+Entities are matched by `unique_id`, which did not change. HA therefore keeps
+your existing **entity IDs** and only updates the friendly names. A sensor that
+was `sensor.oukitel_ep2500_ladestand` stays `sensor.oukitel_ep2500_ladestand`
+and merely displays as "State of charge". Your history and statistics survive.
+
+`dashboard.yaml` in this repository uses the **new** English entity IDs,
+because that is what a fresh install produces. On an upgraded instance it will
+therefore show unavailable rows. Two ways out:
+
+- Keep your own copy of the dashboard with the old IDs. Nothing else is
+  affected.
+- Or rename the entities under Settings > Devices & Services > Entities so they
+  match the new scheme, then take the dashboard from here. Renaming an entity
+  moves its history with it.
+
+The helper for the off-grid night switch was also renamed, from
+`input_boolean.ep2500_offgrid_nachtabschaltung` to
+`input_boolean.ep2500_offgrid_night_off`. That one is yours, not the bridge's,
+so it has to be renamed by hand if you already created it.

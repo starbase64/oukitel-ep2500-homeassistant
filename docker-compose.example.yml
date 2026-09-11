@@ -43,6 +43,9 @@ services:
       # --- optional: Shelly plugs for cross-checking ------------------
       SHELLY_IP:    ""
       SHELLY2_IP:   ""
+      # Margin above the discharge stop at which the device releases the
+      # off-grid output again. 5 on the unit this was written for.
+      OFFGRID_SOC_MARGIN: "5"
       SHELLY_INTERVAL: "5"
 
       # --- logging ----------------------------------------------------
