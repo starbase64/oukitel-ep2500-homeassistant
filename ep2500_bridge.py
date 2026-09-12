@@ -130,6 +130,80 @@ GRID_FAIL_LIMIT = int(os.getenv("GRID_FAIL_LIMIT", "0"))
 # installations.
 CHARGE_HW_MAX = int(os.getenv("CHARGE_HW_MAX", "4000"))
 
+# Operating mode. DP 117 reports what is in effect and is read-only; the five
+# schedule slots 165-169 are writable. Measured on this unit: writing DP 165
+# pulls DP 117 along one second later, in both directions. DP 169 ("other
+# time") is written too so the app view stays consistent, but it is 165 that
+# decides.
+#
+# In backup_power the device charges from the grid at DP 122, unconditionally
+# and regardless of the meter. That is the opposite of zero-export control, so
+# the controller has to be out of the way whenever this mode is active.
+DP_MODE = "117"
+DP_MODE_SLOT1 = "165"
+DP_MODE_SLOT5 = "169"
+MODE_GRID = "grid_priority"
+MODE_BACKUP = "backup_power"
+MODE_VERIFY_DELAY = 8      # s before reading DP 117 back
+
+BACKUP_POWER_DEFAULT = int(os.getenv("BACKUP_POWER", "800"))
+
+# AC surplus charging. The EP2500 absorbs surplus that nothing else takes.
+#
+# The hard part is telling real surplus from surplus another storage unit is
+# producing. Measured on 12.09.: with the EP2500 drawing 800 W the meter read
+# only +146 W, because the neighbouring unit discharged to cover it. The
+# moment the EP2500 stopped, the meter jumped to -639 W. Both controllers held
+# the meter near zero while one battery emptied into the other.
+#
+# The meter alone cannot tell those apart. NEIGHBOUR_TOPIC therefore carries
+# the neighbouring battery's power; while it discharges, no surplus is taken.
+# Phase readings. The Eco Tracker reports the balanced sum and each phase
+# separately. The zero-export controller keeps using ECO_FIELD exactly as
+# before - it is proven and averaged. The surplus logic gets its own set of
+# instantaneous values with one common smoothing filter, so it never compares
+# an averaged sum against an unaveraged phase.
+PHASE_SMOOTH = float(os.getenv("PHASE_SMOOTH", "0.25"))   # EMA weight, 0..1
+PHASE_FIELDS = ("powerPhase1", "powerPhase2", "powerPhase3")
+# How often the phases land in the log. They go to MQTT continuously, but the
+# recordings are what you read afterwards when working out why the surplus
+# logic did what it did - and without the phases in there, the deciding
+# numbers are missing. 0 turns it off.
+PHASE_LOG_INTERVAL = int(os.getenv("PHASE_LOG_INTERVAL", "60"))
+
+# Telling real surplus from surplus a neighbouring battery is producing cannot
+# be done from meter readings alone - a phase reading negative looks the same
+# either way. What does work is checking whether the meter follows our own
+# change: raise the charge limit by one step, wait, and see whether the sum
+# moved with it. If something else compensated, the sum stays put.
+#
+# Every increase is therefore a probe, and only increases are. Coming down is
+# always allowed and immediate. That makes the loop asymmetric in the safe
+# direction and deliberately unhurried.
+# Measured on 12.09. against a Hoymiles 4020X on another phase: 19 s after
+# the EP2500 started drawing 741 W the neighbour had not reacted at all and
+# 74 % of the step still showed at the meter. After 79 s it covered 640 W and
+# only 14 % was left. A verdict at 25 s would therefore have read "genuine"
+# and walked straight into the loop it exists to prevent. The window has to
+# outlast the neighbour's response, not the device's own.
+PROBE_SETTLE = int(os.getenv("PROBE_SETTLE", "90"))   # s before judging a step
+PROBE_ACCEPT = float(os.getenv("PROBE_ACCEPT", "0.6"))  # share the meter must follow
+PROBE_MIN_DRAW = int(os.getenv("PROBE_MIN_DRAW", "60"))  # W; below this no verdict
+
+SURPLUS_ENTER_W = int(os.getenv("SURPLUS_ENTER_W", "100"))
+SURPLUS_ENTER_S = int(os.getenv("SURPLUS_ENTER_S", "120"))
+SURPLUS_EXIT_S = int(os.getenv("SURPLUS_EXIT_S", "90"))
+SURPLUS_MIN_W = int(os.getenv("SURPLUS_MIN_W", "100"))
+SURPLUS_STEP = int(os.getenv("SURPLUS_STEP", "200"))
+NEIGHBOUR_TOPIC = os.getenv("NEIGHBOUR_TOPIC", "")
+# JSON field inside that topic, empty when the payload is a bare number.
+NEIGHBOUR_FIELD = os.getenv("NEIGHBOUR_FIELD", "bat_p")
+# Sign of the neighbour reading. "discharge_positive" matches the Hoymiles
+# bat_p field; use "charge_positive" if yours is the other way round.
+NEIGHBOUR_SIGN = os.getenv("NEIGHBOUR_SIGN", "discharge_positive")
+NEIGHBOUR_DISCHARGE_W = int(os.getenv("NEIGHBOUR_DISCHARGE_W", "40"))
+NEIGHBOUR_MAX_AGE = int(os.getenv("NEIGHBOUR_MAX_AGE", "60"))
+
 # Controller parameters. Starting values; adjustable from HA at runtime and
 # stored as retained MQTT, so they survive a restart of the bridge.
 # TUNABLES: key -> (display name, min, max, step, unit, type)
@@ -325,14 +399,14 @@ def event(text, also_log=True):
         })
         st.events = [e for e in st.events if now_ts - e["ts"] <= EVENT_MAX_AGE
                      ][-EVENT_MAX:]
-        liste = list(st.events)
+        entries = list(st.events)
     if also_log:
         log.info("%s", text)
     try:
         mqttc.publish(f"{BASE}/events", json.dumps({
             "last": text[:250],
-            "count": len(liste),
-            "entries": liste,
+            "count": len(entries),
+            "entries": entries,
         }), retain=True)
     except Exception as exc:
         log.debug("Could not publish event: %s", exc)
@@ -619,8 +693,8 @@ DEVICE_INFO = {
 class State:
     def __init__(self):
         self.lock = threading.Lock()
-        self.dps = {}              # Cache aller bekannten Datenpunkte
-        self.grid = None           # previous Zaehlerwert in W
+        self.dps = {}              # cache of every datapoint seen
+        self.grid = None           # last meter reading in W
         self.grid_ts = 0.0
         self.grid_suspect = None  # jump value awaiting confirmation
         self.control_on = False    # control active?
@@ -628,7 +702,7 @@ class State:
         self.last_write = 0.0
         self.online = False
         self.tune = dict(TUNE_DEFAULTS)
-        self.restored = set()      # welche Werte kamen schon aus MQTT zurueck
+        self.restored = set()      # which values already came back from MQTT
         self.idle_logged = False   # idle lock already reported?
         self.idle_since = 0.0      # last seen idle
         self.offgrid_reported = False
@@ -641,9 +715,28 @@ class State:
         self.pass_soc_warned = False  # warned that a meter target blocks it?
         self.pv_reopen = False     # PV limit still to reopen after pass-through?
         self.grid_fail = False     # meter failure already handled?
+        self.backup_on = False     # manual backup charging requested?
+        self.backup_power = BACKUP_POWER_DEFAULT
+        self.surplus_on = False    # automatic surplus charging enabled?
+        self.surplus_active = False   # charging from surplus right now?
+        self.surplus_since = 0.0   # when surplus was first seen
+        self.surplus_gone = 0.0    # when surplus last disappeared
+        self.charge_setpoint = 0.0  # tracked DP 122 while charging
+        self.charge_before = None  # DP 122 to put back afterwards
+        self.mode_wanted = MODE_GRID
+        self.neighbour_power = None   # neighbouring battery, W
+        self.neighbour_ts = 0.0
+        self.phases = [None, None, None]   # smoothed, W per phase
+        self.phase_sum = None       # smoothed balanced total, W
+        self.phase_ts = 0.0
+        self.ep_phase = int(os.getenv("EP_PHASE", "1"))   # 1..3
+        self.probe_at = 0.0         # when the running probe was started
+        self.probe_meter = None     # smoothed sum before the step
+        self.probe_draw = None      # DP 137 before the step
+        self.phase_logged = 0.0     # when the phases were last written out
         self.setpoint = 0.0            # internal setpoint: >0 export, <0 charge
         self.events = []           # event list for the dashboard
-        self.last_status = None    # previous Geraetestatus (fuer Ereignisse)
+        self.last_status = None    # previous device status (for events)
         self.last_dir = None       # last direction: on / charging / off
         self.was_offline = False   # disconnect already reported?
         self.shelly_ip = SHELLY_IP
@@ -1030,7 +1123,7 @@ def publish_discovery(client):
         "state_topic": f"{BASE}/state",
         "value_template": "{{ value_json.fault_text }}",
         "json_attributes_topic": f"{BASE}/state",
-        "json_attributes_template": "{{ {'rohwert': value_json.fault} | tojson }}",
+        "json_attributes_template": "{{ {'raw': value_json.fault} | tojson }}",
         "icon": "mdi:alert-circle-outline",
         "entity_category": "diagnostic",
         "availability_topic": f"{BASE}/available",
@@ -1044,6 +1137,97 @@ def publish_discovery(client):
         "value_template": "{{ 'ON' if value_json.fault_active else 'OFF' }}",
         "payload_on": "ON", "payload_off": "OFF",
         "device_class": "problem",
+        "entity_category": "diagnostic",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    # Per-phase readings from the meter. The zero-export controller does not
+    # use these - it keeps its own averaged value - but the surplus logic does,
+    # and seeing them makes it obvious which phase is doing what.
+    for nr in (1, 2, 3):
+        client.publish(f"{DISC}/sensor/ep2500/phase{nr}/config", json.dumps({
+            "name": f"Phase {nr}",
+            "unique_id": f"ep2500_phase{nr}",
+            "state_topic": f"{BASE}/state",
+            "value_template": "{{ value_json.phase" + str(nr) + " }}",
+            "unit_of_measurement": "W",
+            "device_class": "power",
+            "state_class": "measurement",
+            "availability_topic": f"{BASE}/available",
+            "device": DEVICE_INFO,
+        }), retain=True)
+
+    client.publish(f"{DISC}/select/ep2500/phase/config", json.dumps({
+        "name": "EP2500 phase",
+        "unique_id": "ep2500_ep_phase",
+        "state_topic": f"{BASE}/phase",
+        "command_topic": f"{BASE}/phase/set",
+        "options": ["1", "2", "3"],
+        "icon": "mdi:sine-wave",
+        "entity_category": "config",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    client.publish(f"{DISC}/sensor/ep2500/own_phase_load/config", json.dumps({
+        "name": "Other load on own phase",
+        "unique_id": "ep2500_own_phase_load",
+        "state_topic": f"{BASE}/state",
+        "value_template": "{{ value_json.own_phase_load }}",
+        "unit_of_measurement": "W",
+        "device_class": "power",
+        "state_class": "measurement",
+        "entity_category": "diagnostic",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    # Backup charging: manual, overrides everything else
+    client.publish(f"{DISC}/switch/ep2500/backup/config", json.dumps({
+        "name": "Backup charge",
+        "unique_id": "ep2500_backup",
+        "state_topic": f"{BASE}/backup/state",
+        "command_topic": f"{BASE}/backup/set",
+        "payload_on": "ON", "payload_off": "OFF",
+        "icon": "mdi:home-lightning-bolt",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    client.publish(f"{DISC}/number/ep2500/backup_power/config", json.dumps({
+        "name": "Backup charge power",
+        "unique_id": "ep2500_backup_power",
+        "state_topic": f"{BASE}/backup/power",
+        "command_topic": f"{BASE}/backup/power/set",
+        "min": 0, "max": CHARGE_HW_MAX, "step": 50,
+        "unit_of_measurement": "W",
+        "device_class": "power",
+        "mode": "box",
+        "icon": "mdi:battery-charging-high",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    # AC surplus charging: automatic
+    client.publish(f"{DISC}/switch/ep2500/surplus/config", json.dumps({
+        "name": "AC surplus charging",
+        "unique_id": "ep2500_surplus",
+        "state_topic": f"{BASE}/surplus/state",
+        "command_topic": f"{BASE}/surplus/set",
+        "payload_on": "ON", "payload_off": "OFF",
+        "icon": "mdi:solar-power-variant",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    client.publish(f"{DISC}/binary_sensor/ep2500/surplus_active/config", json.dumps({
+        "name": "Taking surplus",
+        "unique_id": "ep2500_surplus_active",
+        "state_topic": f"{BASE}/state",
+        "value_template": "{{ 'ON' if value_json.surplus_active else 'OFF' }}",
+        "payload_on": "ON", "payload_off": "OFF",
+        "device_class": "running",
         "entity_category": "diagnostic",
         "availability_topic": f"{BASE}/available",
         "device": DEVICE_INFO,
@@ -1126,6 +1310,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
               f"{BASE}/socmax/set", f"{BASE}/socmin/set",
               f"{BASE}/shelly_ip/set", f"{BASE}/shelly/set",
               f"{BASE}/shelly2_ip/set", f"{BASE}/shelly2/set",
+              f"{BASE}/phase/set", f"{BASE}/backup/set",
+              f"{BASE}/backup/power/set", f"{BASE}/surplus/set",
               f"{BASE}/ac_storage1_ip/set", f"{BASE}/ac_storage1/set",
               f"{BASE}/ac_storage2_ip/set", f"{BASE}/ac_storage2/set",
               f"{BASE}/offgrid/set", f"{BASE}/record/set"):
@@ -1143,6 +1329,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{BASE}/passthrough/state")
     client.subscribe(f"{BASE}/shelly_ip")
     client.subscribe(f"{BASE}/shelly2_ip")
+    client.subscribe(f"{BASE}/phase")
+    client.subscribe(f"{BASE}/backup/power")
+    client.subscribe(f"{BASE}/surplus/state")
+    if NEIGHBOUR_TOPIC:
+        client.subscribe(NEIGHBOUR_TOPIC)
     client.subscribe(f"{BASE}/ac_storage1_ip")
     client.subscribe(f"{BASE}/ac_storage2_ip")
 
@@ -1164,6 +1355,15 @@ def publish_settings():
     # shows "empty value" even though something was in it before.
     if "shelly_ip" not in st.restored and st.shelly_ip:
         mqttc.publish(f"{BASE}/shelly_ip", st.shelly_ip, retain=True)
+    if "phase" not in st.restored:
+        mqttc.publish(f"{BASE}/phase", str(st.ep_phase), retain=True)
+    if "backup_power" not in st.restored:
+        mqttc.publish(f"{BASE}/backup/power", str(st.backup_power), retain=True)
+    if "surplus" not in st.restored:
+        mqttc.publish(f"{BASE}/surplus/state",
+                      "ON" if st.surplus_on else "OFF", retain=True)
+    mqttc.publish(f"{BASE}/backup/state",
+                  "ON" if st.backup_on else "OFF", retain=True)
     if "shelly2_ip" not in st.restored and st.shelly2_ip:
         mqttc.publish(f"{BASE}/shelly2_ip", st.shelly2_ip, retain=True)
     for key in ("ac_storage1", "ac_storage2"):
@@ -1339,6 +1539,87 @@ def on_message(client, userdata, msg):
         else:
             event("Switching backflow prevention failed")
         publish_state()
+        return
+
+    if NEIGHBOUR_TOPIC and topic == NEIGHBOUR_TOPIC:
+        value = parse_number(payload, NEIGHBOUR_FIELD)
+        if value is not None:
+            with st.lock:
+                st.neighbour_power = float(value)
+                st.neighbour_ts = time.time()
+        return
+
+    if topic == f"{BASE}/phase/set":
+        try:
+            nr = int(payload)
+        except ValueError:
+            return
+        if nr not in (1, 2, 3):
+            return
+        with st.lock:
+            st.ep_phase = nr
+        st.restored.add("phase")
+        client.publish(f"{BASE}/phase", str(nr), retain=True)
+        event(f"EP2500 is on phase {nr}")
+        return
+
+    if topic == f"{BASE}/phase":
+        if "phase" not in st.restored and payload in ("1", "2", "3"):
+            with st.lock:
+                st.ep_phase = int(payload)
+            st.restored.add("phase")
+        return
+
+    if topic == f"{BASE}/backup/power/set":
+        try:
+            watt = max(0, min(CHARGE_HW_MAX, int(float(payload))))
+        except ValueError:
+            return
+        st.backup_power = watt
+        st.restored.add("backup_power")
+        client.publish(f"{BASE}/backup/power", str(watt), retain=True)
+        if st.backup_on:
+            set_charge(watt, reason="backup charge")
+        publish_state()
+        return
+
+    if topic == f"{BASE}/backup/power":
+        if "backup_power" not in st.restored and payload:
+            try:
+                st.backup_power = int(float(payload))
+                st.restored.add("backup_power")
+            except ValueError:
+                pass
+        return
+
+    if topic == f"{BASE}/backup/set":
+        want = payload.upper() == "ON"
+        if want and not st.backup_on:
+            start_backup()
+        elif not want and st.backup_on:
+            st.backup_on = False
+            stop_charging("backup switched off")
+        client.publish(f"{BASE}/backup/state", "ON" if st.backup_on else "OFF",
+                       retain=True)
+        publish_state()
+        return
+
+    if topic == f"{BASE}/surplus/set":
+        st.surplus_on = payload.upper() == "ON"
+        st.restored.add("surplus")
+        if not st.surplus_on and st.surplus_active:
+            stop_charging("surplus charging switched off")
+        event("AC surplus charging "
+              + ("enabled" if st.surplus_on else "disabled"))
+        client.publish(f"{BASE}/surplus/state",
+                       "ON" if st.surplus_on else "OFF", retain=True)
+        publish_state()
+        return
+
+    if topic == f"{BASE}/surplus/state":
+        if "surplus" not in st.restored and payload:
+            st.surplus_on = payload.upper() == "ON"
+            st.restored.add("surplus")
         return
 
     if topic == f"{BASE}/record/set":
@@ -1729,6 +2010,17 @@ def publish_state():
     # sensor on the raw value would raise on alarm while the text next to it
     # reads "no fault".
     out["fault_active"] = fault_serious
+    with st.lock:
+        for nr in (1, 2, 3):
+            value = st.phases[nr - 1]
+            out[f"phase{nr}"] = round(value) if value is not None else None
+        out["ep_phase"] = st.ep_phase
+    other = own_phase_load(dps)
+    out["own_phase_load"] = round(other) if other is not None else None
+    out["backup"] = st.backup_on
+    out["surplus_enabled"] = st.surplus_on
+    out["surplus_active"] = st.surplus_active
+    out["charge_setpoint"] = int(st.charge_setpoint)
     if DP_OFFGRID in dps:
         out["offgrid"] = bool(dps[DP_OFFGRID])
     if DP_BACKFLOW in dps:
@@ -1818,6 +2110,71 @@ def tuya_loop():
 # Eco Tracker (everHome Local API)
 # --------------------------------------------------------------------------
 
+def accept_phases(data):
+    """Takes the per-phase readings and the balanced sum, smoothed.
+
+    All four use the instantaneous fields and the same filter, so they stay
+    comparable. Anything implausible is dropped rather than smoothed in.
+    """
+    values = []
+    for field in ("power",) + PHASE_FIELDS:
+        raw = data.get(field)
+        if not isinstance(raw, (int, float)) or not math.isfinite(raw):
+            return
+        if abs(raw) > ECO_ABSURD:
+            return
+        values.append(float(raw))
+
+    with st.lock:
+        previous = [st.phase_sum] + list(st.phases)
+        smoothed = []
+        for old, new in zip(previous, values):
+            if old is None:
+                smoothed.append(new)
+            else:
+                smoothed.append(old + (new - old) * PHASE_SMOOTH)
+        st.phase_sum, st.phases = smoothed[0], smoothed[1:]
+        st.phase_ts = time.time()
+
+
+def log_phases():
+    """Writes the phase readings to the log at a calm cadence."""
+    if not PHASE_LOG_INTERVAL:
+        return
+    now = time.time()
+    with st.lock:
+        if now - st.phase_logged < PHASE_LOG_INTERVAL:
+            return
+        st.phase_logged = now
+        values, total, phase = list(st.phases), st.phase_sum, st.ep_phase
+    if total is None or any(v is None for v in values):
+        return
+    other = own_phase_load(st.snapshot())
+    log.info("Phases | L1 %+5.0f | L2 %+5.0f | L3 %+5.0f | sum %+5.0f W | "
+             "own L%d, others %s",
+             values[0], values[1], values[2], total, phase,
+             "?" if other is None else f"{other:+.0f} W")
+
+
+def own_phase_load(dps):
+    """Load on the EP2500's phase with its own contribution removed.
+
+    The device knows what it is drawing or feeding (DP 137, positive while
+    importing). Subtracting that leaves what everything else on that phase is
+    doing - which is what point 1 and 2 of the phase idea were about.
+    """
+    with st.lock:
+        phase = st.ep_phase
+        value = st.phases[phase - 1] if 1 <= phase <= 3 else None
+        age = time.time() - st.phase_ts
+    if value is None or age > GRID_MAX_AGE:
+        return None
+    own = dps.get("137")
+    if not isinstance(own, (int, float)):
+        return None
+    return value - own
+
+
 def accept_meter_value(val, source=""):
     """Checks a meter reading and takes it into the state.
 
@@ -1884,7 +2241,10 @@ def eco_loop():
 
             val = data.get(ECO_FIELD)
             if val is None:
-                raise ValueError(f"Feld {ECO_FIELD!r} fehlt in der Antwort")
+                raise ValueError(f"field {ECO_FIELD!r} missing from the reply")
+
+            accept_phases(data)
+            log_phases()
 
             # agePower is the age of the reading in ms. A very old value means
             # the tracker itself is no longer receiving data.
@@ -2085,6 +2445,217 @@ def set_pv_limit(watt, reason=""):
     return write_dp(DP_PV_LIMIT, watt, 4000, reason)
 
 
+def neighbour_discharging(now=None):
+    """Is a neighbouring storage unit currently discharging?
+
+    Returns (discharging, known). Without a configured or fresh reading
+    ``known`` is False, and the caller has to decide how careful to be.
+    """
+    now = now or time.time()
+    if not NEIGHBOUR_TOPIC:
+        return False, False
+    with st.lock:
+        power, timestamp = st.neighbour_power, st.neighbour_ts
+    if power is None or now - timestamp > NEIGHBOUR_MAX_AGE:
+        return False, False
+    if NEIGHBOUR_SIGN == "charge_positive":
+        power = -power
+    return power > NEIGHBOUR_DISCHARGE_W, True
+
+
+def set_mode(mode, reason=""):
+    """Switches the operating mode and verifies the device followed.
+
+    DP 165 is the slot that takes effect; DP 169 is written as well so the
+    app shows a consistent picture. The reply frame cannot be trusted - in
+    testing a write to 165 was acknowledged with an unrelated datapoint - so
+    DP 117 is read back a few seconds later.
+    """
+    st.mode_wanted = mode
+    ok = write_dp_raw(DP_MODE_SLOT1, mode, reason)
+    write_dp_raw(DP_MODE_SLOT5, mode, reason)
+    # Verify even when the write was reported as rejected. Twice now a "no
+    # response" was followed a second later by the device reporting the new
+    # value - the command landed, only the acknowledgement was lost. Skipping
+    # the read-back there would leave the switch unverified precisely when it
+    # matters most.
+    threading.Timer(MODE_VERIFY_DELAY, verify_mode, (mode,)).start()
+    return ok
+
+
+def verify_mode(expected):
+    """Reads DP 117 back and reports when the device did not follow."""
+    dps = read_device_status()
+    if dps is None or DP_MODE not in dps:
+        return
+    actual = dps[DP_MODE]
+    if actual != expected:
+        event(f"Operating mode: device reports {actual}, requested "
+              f"{expected} - retrying")
+        write_dp_raw(DP_MODE_SLOT1, expected, "mode retry")
+    # Slot 5 is cosmetic - only slot 1 decides - but it was seen reverting on
+    # its own after a write, which leaves the app showing a schedule that is
+    # not in effect. Put it back quietly.
+    if dps.get(DP_MODE_SLOT5) not in (None, expected):
+        log.info("DP %s drifted back to %r, correcting",
+                 DP_MODE_SLOT5, dps[DP_MODE_SLOT5])
+        write_dp_raw(DP_MODE_SLOT5, expected, "slot 5 resync")
+    publish_state()
+
+
+def write_dp_raw(dp, value, reason=""):
+    """Writes a non-numeric datapoint. Returns True when accepted."""
+    res = tuya_call("set_value", int(dp), value)
+    ok, reason_txt = response_ok(res)
+    if ok:
+        st.last_write = time.time()
+        st.merge({dp: value})
+        log.info("DP %s -> %r (%s)", dp, value, reason or "control")
+        return True
+    log.warning("DP %s -> %r rejected: %s", dp, value, reason_txt)
+    return False
+
+
+def probe_verdict(meter_now, draw_now, now=None):
+    """Judges a running probe. Returns (verdict, detail).
+
+    verdict is "wait" while the step is still settling, "genuine" when the
+    meter followed our own change, "compensated" when something else made up
+    for it, and "unclear" when the device did not actually change its draw.
+    """
+    now = now or time.time()
+    if not st.probe_at:
+        return "wait", "no probe running"
+    if now - st.probe_at < PROBE_SETTLE:
+        return "wait", "settling"
+    if st.probe_meter is None or st.probe_draw is None:
+        return "unclear", "no reference taken"
+    if not isinstance(meter_now, (int, float)) or not isinstance(draw_now, (int, float)):
+        return "unclear", "no reading"
+
+    delta_draw = draw_now - st.probe_draw
+    delta_meter = meter_now - st.probe_meter
+    if delta_draw < PROBE_MIN_DRAW:
+        return "unclear", f"device only changed by {delta_draw:.0f} W"
+    share = delta_meter / delta_draw
+    detail = (f"drew {delta_draw:+.0f} W, meter moved {delta_meter:+.0f} W "
+              f"({share * 100:.0f} %)")
+    if share >= PROBE_ACCEPT:
+        return "genuine", detail
+    return "compensated", detail
+
+
+def surplus_decision(grid, soc, socmax, draw, now=None):
+    """Decides what AC surplus charging should do this cycle.
+
+    Pure function, so the whole state machine can be exercised without a
+    device. Returns (action, watts, reason); action is one of "enter",
+    "probe", "hold", "lower", "leave" or "idle".
+
+    Only increases are probed. Lowering is immediate and never needs
+    permission - that keeps the loop safe by construction and calm by
+    default: at most one step up per PROBE_SETTLE seconds.
+    """
+    now = now or time.time()
+
+    def leave(why):
+        st.surplus_since = 0.0
+        st.surplus_gone = 0.0
+        st.probe_at = 0.0
+        return "leave", 0, why
+
+    if isinstance(soc, (int, float)) and isinstance(socmax, (int, float)):
+        if soc >= socmax:
+            return leave("battery full")
+    if grid is None:
+        return leave("no meter reading")
+
+    # The neighbour reading stays optional. Where it exists it saves the
+    # probing entirely, because the answer is already known.
+    discharging, known = neighbour_discharging(now)
+    if known and discharging:
+        return leave("neighbouring battery is discharging")
+
+    surplus = -grid
+
+    if not st.surplus_active:
+        if surplus < SURPLUS_ENTER_W:
+            st.surplus_since = 0.0
+            return "idle", 0, "not enough surplus"
+        if not st.surplus_since:
+            st.surplus_since = now
+            return "idle", 0, "surplus seen, waiting for confirmation"
+        if now - st.surplus_since < SURPLUS_ENTER_S:
+            return "idle", 0, "surplus confirming"
+        st.surplus_gone = 0.0
+        # The first step is a probe like any other, and capped like any
+        # other. Jumping straight to the full surplus would put several
+        # hundred unverified watts on the grid before the first check.
+        first = int(min(surplus, SURPLUS_STEP, CHARGE_HW_MAX))
+        return "enter", first, f"surplus confirmed, starting at {first} W"
+
+    # Importing: come down at once, no probe, no waiting.
+    if grid > 0:
+        st.probe_at = 0.0
+        wanted = max(0, st.charge_setpoint - grid)
+        if wanted < SURPLUS_MIN_W:
+            if not st.surplus_gone:
+                st.surplus_gone = now
+            elif now - st.surplus_gone >= SURPLUS_EXIT_S:
+                return leave("surplus gone")
+            return "lower", int(max(0, wanted)), "importing, backing off"
+        return "lower", int(wanted), "importing, backing off"
+
+    st.surplus_gone = 0.0
+
+    # A probe in flight has to be judged before anything else happens.
+    verdict, detail = probe_verdict(st.phase_sum, draw, now)
+    if verdict == "wait":
+        if st.probe_at:
+            return "hold", int(st.charge_setpoint), "probe settling"
+    elif verdict == "compensated":
+        st.probe_at = 0.0
+        return leave(f"another source compensated - {detail}")
+    elif verdict in ("genuine", "unclear"):
+        st.probe_at = 0.0
+
+    if surplus < SURPLUS_MIN_W:
+        return "hold", int(st.charge_setpoint), "balanced"
+
+    step = int(min(SURPLUS_STEP, surplus))
+    wanted = int(min(CHARGE_HW_MAX, st.charge_setpoint + step))
+    if wanted == st.charge_setpoint:
+        return "hold", int(st.charge_setpoint), "at the limit"
+    return "probe", wanted, f"testing {step} W more"
+
+
+def start_backup():
+    """Charges the battery from the grid until it is full. Manual only."""
+    st.backup_on = True
+    st.surplus_active = False
+    stop_passthrough("backup charging", safe_limit=LIMIT_SAFE)
+    if st.charge_before is None:
+        st.charge_before = st.dps.get(DP_CHARGE, st.tune["charge_limit"])
+    set_charge(st.backup_power, reason="backup charge")
+    set_mode(MODE_BACKUP, reason="backup charge")
+    event(f"Backup charging started at {st.backup_power} W - control paused")
+
+
+def stop_charging(reason):
+    """Leaves grid charging and restores everything it changed."""
+    was_active = st.surplus_active or st.backup_on
+    st.surplus_active = False
+    st.charge_setpoint = 0.0
+    if st.mode_wanted != MODE_GRID:
+        set_mode(MODE_GRID, reason=reason)
+    if st.charge_before is not None:
+        set_charge(st.charge_before, reason=reason)
+        st.charge_before = None
+    if was_active:
+        event(f"Grid charging ended ({reason})")
+    publish_state()
+
+
 def stop_passthrough(reason, safe_limit=None):
     """Ends pass-through and restores every limit it may have changed."""
     was_active = st.pass_active
@@ -2183,7 +2754,7 @@ FEHLER_BITS = {
     128: "AC output overload",   # Bit 7
 }
 # Bits that occur in undisturbed operation and are not faults.
-FEHLER_HARMLOS = {2}                  # Bit 1, wechselt zusammen mit 101/114
+FAULT_HARMLESS = {2}                  # Bit 1, wechselt zusammen mit 101/114
 
 
 def fault_text(value):
@@ -2200,7 +2771,7 @@ def fault_text(value):
         mask = 1 << bit
         if not value & mask:
             continue
-        if mask in FEHLER_HARMLOS:
+        if mask in FAULT_HARMLESS:
             continue
         serious = True
         parts.append(FEHLER_BITS.get(mask,
@@ -2225,12 +2796,77 @@ def control_loop():
     while True:
         time.sleep(st.tune["interval"])
 
-        if not st.control_on or not st.online:
+        if not st.online:
             continue
 
         dps = st.snapshot()
         limit = dps.get(DP_LIMIT)
         if limit is None:
+            continue
+
+        # ------------------------------------------------------------------
+        # Priority: backup > pass-through > AC surplus > zero-export
+        # ------------------------------------------------------------------
+        # Backup was asked for by hand, so it wins over everything. It stops
+        # by itself at the charge stop, because leaving the device sitting at
+        # 100 % costs harvest for hours.
+        if st.backup_on:
+            soc_now, soc_max = dps.get("102"), dps.get(DP_SOC_MAX)
+            if (isinstance(soc_now, (int, float))
+                    and isinstance(soc_max, (int, float))
+                    and soc_now >= soc_max):
+                st.backup_on = False
+                stop_charging(f"battery full at {soc_now} %")
+                mqttc.publish(f"{BASE}/backup/state", "OFF", retain=True)
+            continue
+
+        # AC surplus charging and a negative meter target cancel each other
+        # out: one deliberately creates export, the other absorbs it. Running
+        # both is a loop, so it is refused rather than silently prioritised.
+        if st.surplus_on and st.correction < 0:
+            if not st.surplus_active:
+                st.surplus_on = False
+                event("AC surplus charging disabled - it cannot run "
+                      "alongside a negative meter target")
+                mqttc.publish(f"{BASE}/surplus/state", "OFF", retain=True)
+
+        if st.surplus_on and not st.pass_active:
+            with st.lock:
+                smoothed = st.phase_sum
+            action, watt, why = surplus_decision(
+                smoothed, dps.get("102"), dps.get(DP_SOC_MAX), dps.get("137"))
+            if action in ("enter", "probe", "lower", "hold"):
+                if not st.surplus_active:
+                    stop_passthrough("surplus charging", safe_limit=LIMIT_SAFE)
+                    st.surplus_active = True
+                    if st.charge_before is None:
+                        st.charge_before = dps.get(DP_CHARGE,
+                                                   st.tune["charge_limit"])
+                    set_mode(MODE_BACKUP, reason="surplus charging")
+                    event(f"Taking AC surplus - {why}")
+                if action in ("enter", "probe"):
+                    with st.lock:
+                        st.probe_meter, st.probe_draw = smoothed, dps.get("137")
+                        st.probe_at = time.time()
+                if watt != int(st.charge_setpoint):
+                    st.charge_setpoint = watt
+                    with st.lock:
+                        ph = list(st.phases)
+                    log.info("Surplus | sum %s W | L1 %s L2 %s L3 %s | "
+                             "charge -> %s W (%s)",
+                             None if smoothed is None else round(smoothed),
+                             *[("?" if v is None else round(v)) for v in ph],
+                             watt, why)
+                    set_charge(watt, reason="surplus charging")
+                    publish_state()
+                continue
+            if action == "leave" and st.surplus_active:
+                event(f"AC surplus charging stopped - {why}")
+                stop_charging(why)
+        elif st.surplus_active:
+            stop_charging("superseded")
+
+        if not st.control_on:
             continue
 
         # Every mode that feeds the grid needs a fresh meter value. Keeping

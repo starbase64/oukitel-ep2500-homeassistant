@@ -7,7 +7,7 @@ views:
     dense_section_placement: false
     sections:
       # ------------------------------------------------------------------
-      # Spalte 1: Ausgelesene Werte
+      # Column 1: readings
       # ------------------------------------------------------------------
       - type: grid
         column_span: 1
@@ -55,6 +55,19 @@ views:
                     name: Shelly
                   - entity: sensor.oukitel_ep2500_north_pv_power
                     name: North PV
+              - type: glance
+                title: Meter phases
+                columns: 4
+                state_color: false
+                entities:
+                  - entity: sensor.oukitel_ep2500_phase_1
+                    name: L1
+                  - entity: sensor.oukitel_ep2500_phase_2
+                    name: L2
+                  - entity: sensor.oukitel_ep2500_phase_3
+                    name: L3
+                  - entity: sensor.oukitel_ep2500_other_load_on_own_phase
+                    name: Others
           - type: entities
             title: Power
             show_header_toggle: false
@@ -131,7 +144,7 @@ views:
                 name: Grid frequency
 
       # ------------------------------------------------------------------
-      # Spalte 2: Steuerung und Einstellungen
+      # Column 2: control and settings
       # ------------------------------------------------------------------
       - type: grid
         column_span: 1
@@ -182,6 +195,18 @@ views:
                 name: Export limit
               - entity: number.oukitel_ep2500_battery_charge_limit
                 name: Battery charge limit (PV + grid)
+              - entity: select.oukitel_ep2500_ep2500_phase
+                name: EP2500 phase
+              - type: divider
+              - entity: switch.oukitel_ep2500_backup_charge
+                name: Backup (charge from grid)
+              - entity: number.oukitel_ep2500_backup_charge_power
+                name: '  Backup charge power'
+              - entity: switch.oukitel_ep2500_ac_surplus_charging
+                name: AC surplus charging
+              - entity: binary_sensor.oukitel_ep2500_taking_surplus
+                name: '  taking surplus now'
+              - type: divider
               - entity: number.oukitel_ep2500_meter_target
                 name: Meter target (+ import / - export)
               - entity: sensor.oukitel_ep2500_effective_meter_target
@@ -245,7 +270,7 @@ views:
                 name: Actual
 
       # ------------------------------------------------------------------
-      # Spalte 3: Verlauf und Ereignisse
+      # Column 3: history and events
       # ------------------------------------------------------------------
       - type: grid
         column_span: 1
@@ -262,9 +287,9 @@ views:
             card:
               type: markdown
               content: >-
-                <ha-alert alert-type="error">**Systemfehler:** {{
-                states('sensor.oukitel_ep2500_system_fault') }} (Rohwert {{
-                state_attr('sensor.oukitel_ep2500_system_fault', 'rohwert')
+                <ha-alert alert-type="error">**System fault:** {{
+                states('sensor.oukitel_ep2500_system_fault') }} (raw {{
+                state_attr('sensor.oukitel_ep2500_system_fault', 'raw')
                 }}). Latched until the device is restarted.</ha-alert>
           - type: markdown
             title: Events (48 h)
@@ -275,10 +300,10 @@ views:
                   overflow-y: auto;
                 }
             content: >-
-              {% set liste = state_attr('sensor.oukitel_ep2500_events',
+              {% set entries = state_attr('sensor.oukitel_ep2500_events',
               'entries') %}
 
-              {% if liste %} {% for e in liste | reverse | list %} **{{ e.t }}** ·
+              {% if entries %} {% for e in entries | reverse | list %} **{{ e.t }}** ·
               {{ e.m }}
 
               {% endfor %} {% else %} _No events recorded yet._ {%

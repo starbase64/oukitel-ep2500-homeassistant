@@ -52,6 +52,31 @@ services:
       # Points above the pass-through target at which protection against the
       # 100 % shutdown overrides a meter target. 0 disables the override.
       PASS_OVERRIDE: "3"
+      # --- phases and surplus charging ---------------------------------
+      # Which phase the EP2500 is wired to. Also selectable from the
+      # dashboard; this is only the fallback before anything is stored.
+      EP_PHASE:     "1"
+      PHASE_SMOOTH: "0.25"
+      # Seconds between phase lines in the log. 0 turns them off.
+      PHASE_LOG_INTERVAL: "60"
+
+      # Surplus charging probes before it commits: it raises the charge limit
+      # by one step, waits, and checks whether the meter followed. If another
+      # storage unit compensated, the meter does not move and charging stops.
+      PROBE_SETTLE: "90"
+      PROBE_ACCEPT: "0.6"
+      SURPLUS_STEP: "200"
+      SURPLUS_ENTER_W: "100"
+      SURPLUS_ENTER_S: "120"
+      SURPLUS_EXIT_S: "90"
+
+      # Optional shortcut: if a neighbouring battery publishes its power over
+      # MQTT, the bridge can skip the probing. Positive means discharging by
+      # default; set NEIGHBOUR_SIGN to "charge_positive" if yours differs.
+      NEIGHBOUR_TOPIC: ""
+      NEIGHBOUR_FIELD: "bat_p"
+      NEIGHBOUR_SIGN: "discharge_positive"
+
       AC_STORAGE1_IP: ""
       AC_STORAGE2_IP: ""
       AC_STORAGE_MAX_AGE: "15"
