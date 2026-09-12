@@ -67,6 +67,26 @@ Note the combination while the socket is idle: DP 135 around 235 V, DP 140 at
 0.25 A, and DP 141/142 at 0 W. Roughly 60 VA of apparent power with no real
 load reported — the inverter holding an energised output for an empty socket.
 
+**Note on DP 117 / 165-169 – operating mode:** DP 117 reports what is in
+effect and is read-only. The five schedule slots 165-169 are writable, and
+writing slot 1 (DP 165) pulls DP 117 along about one second later, in both
+directions. In `backup_power` the device charges from the grid at DP 122,
+unconditionally and regardless of the meter.
+
+Two things to watch. The reply to a write cannot be trusted: a write to DP 165
+was once acknowledged with an unrelated datapoint, and twice a write reported
+as "no response" was in effect a second later. Always read DP 117 back. And
+DP 169 was observed reverting to its previous value on its own after a
+successful write, leaving the app showing a schedule that is not in effect.
+
+**Note on a neighbouring storage unit:** with a Hoymiles 4020X on another
+phase, a step change by the EP2500 takes up to 80 seconds to be fully
+compensated. Measured on 12.09.: 19 s after the EP2500 began drawing 741 W the
+neighbour had not reacted at all and 74 % of the step still showed at the
+meter; after 79 s it was covering 640 W and only 14 % remained. Anything that
+judges its own effect on the meter has to wait longer than that, or it will
+mistake a loop for genuine surplus.
+
 **Note on standby self-consumption:** after reaching the discharge-stop SoC the
 device goes to standby and stops feeding, but keeps draining the battery. Two
 nights measured at 14–15 % state of charge, with `BATT_WH` of 2048 one point
