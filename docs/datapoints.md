@@ -45,17 +45,49 @@ found for PV charge power 1 – possibly identical with 156.
 **Note on DP 119 – off-grid socket:** this is the permission, not the state.
 The device releases the output only once the state of charge is five points
 above the discharge stop (DP 124). Below that it acknowledges a write and
-leaves the socket dead. There is no readout that tells you the actual
-state. DP 135 (off-grid voltage) looks like one but is not: across three
-measurement runs it never left the 231–237 V band — overnight in standby, with
-the output switched off, and on an empty battery alike. It appears to report
-an internal bus voltage rather than the socket.
+leaves the socket dead. DP 119 also only appears in the log when it *changes*,
+so its silence says nothing about the current state.
 
-**Note on standby self-consumption:** after reaching the discharge-stop SoC
-the device goes to standby and stops feeding, but keeps draining the battery —
-measured at roughly 38 W, with the off-grid socket live at 0 A the whole time
-(DP 135 at 231–236 V, DP 140 at 0). Details and a way to switch the socket off
-overnight are in [setup.md](setup.md), section "The off-grid socket".
+**DP 140 (off-grid output current) is the readout that does tell you.** With
+the socket live it sits at 0.2 to 0.3 A even with nothing plugged in; the
+moment the output is switched off it drops to 0 and stays there. In one
+measurement run the transition is a single line at sunset:
+
+```
+19:53:42  DP 140  Off-grid current  2 -> 0
+```
+
+**DP 135 (off-grid voltage) is not a state readout**, despite looking like the
+obvious candidate. Across four measurement runs it never left the 231–244 V
+band — in standby, with the output off, and on an empty battery alike. It
+appears to report an internal bus voltage rather than the socket. A watchdog
+built on it produced nothing but false alarms.
+
+Note the combination while the socket is idle: DP 135 around 235 V, DP 140 at
+0.25 A, and DP 141/142 at 0 W. Roughly 60 VA of apparent power with no real
+load reported — the inverter holding an energised output for an empty socket.
+
+**Note on standby self-consumption:** after reaching the discharge-stop SoC the
+device goes to standby and stops feeding, but keeps draining the battery. Two
+nights measured at 14–15 % state of charge, with `BATT_WH` of 2048 one point
+equals 20.5 Wh:
+
+| Night | Off-grid socket | Minutes per point | Self-consumption |
+|---|---|---|---|
+| 09./10.09. | on | 79–80 (six transitions) | ~15.6 W |
+| 11./12.09. | off | 285 (one transition) | ~4.3 W |
+
+So the energised socket costs roughly 11 W, about 70 % of the idle draw.
+`homeassistant/offgrid_night.yaml` switches it off between sunset and sunrise;
+details in [setup.md](setup.md), section "The off-grid socket".
+
+Two caveats on those figures. The 4.3 W rest on a single percentage point
+against six for the 15.6 W, so treat the exact value as provisional. And both
+runs sit at 14–15 %, where the LiFePO4 curve is flat and the BMS estimate of a
+percentage point is coarse.
+
+The discharge stop protects the battery from the controller, not from the
+device itself: below it, the pack keeps draining.
 
 **Note on DP 149 – system fault:** the app shows this value in the storage
 menu labelled "system fault". A deliberately induced overload on the AC output
@@ -93,14 +125,14 @@ even with an empty battery and full sun. See the section on quirks below.
 | 131 | Lowest single cell voltage | mV | certain |
 | 132 / 133 | Cell temperatures (highest / lowest) | ÷10 → °C | certain |
 | 134 | Status: `charge_status` / `discharge_status` / `standy_status` | enum | certain |
-| 135 | Off-grid output voltage | ÷10 → V | certain |
+| 135 | Off-grid output voltage, not a state readout (see note) | ÷10 → V | certain |
 | 137 | Grid power (mirrors 155) | W | likely |
 | 138 | Grid frequency | ÷100 → Hz | certain |
 | 139 | Grid voltage | ÷10 → V | certain |
 | 149 | System fault register, latched (see note) | – | certain |
 | 136 | Grid current | ÷10 → 0.8 A | certain |
 | 141 / 142 | Off-grid socket load, both registers identical | W | certain |
-| 140 | Off-grid output current | ÷10 → 8.7 A | certain |
+| 140 | Off-grid output current, 0 when the socket is off | ÷10 → 8.7 A | certain |
 | 143 | Total PV power | W | certain |
 | 155 | AC output power (**excluding** off-grid load) | W | certain |
 

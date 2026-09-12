@@ -530,28 +530,48 @@ Every switch command is read back from the device a few seconds later. The
 EP2500 acknowledges commands it does not carry out, and without the read-back
 the requested value would sit in the cache and in Home Assistant.
 
-What the bridge cannot do is show you the real state of the socket, because
-no datapoint reports it. DP 135 looks like the obvious candidate and is not:
-it sits at 231 to 237 V no matter what, including overnight in standby with
+DP 135 looks like the obvious readout for the socket's real state and is not:
+it sits at 231 to 244 V no matter what, including overnight in standby with
 the output off. A watchdog built on it produced nothing but false alarms and
-was removed again. The state-of-charge lockout above is the one statement
-that holds up, so that is what gets reported.
+was removed again.
+
+**DP 140 (off-grid current) is the one that works.** With the socket live it
+reads 0.2 to 0.3 A even with nothing plugged in, and it drops to 0 the moment
+the output is switched off. DP 119 is no help here either — it only shows up
+in the log when it changes, so its silence says nothing about the current
+state.
 
 ## What idling costs
 
 Once the device reaches the discharge-stop SoC it goes to standby and stops
-feeding, but it keeps draining the battery. Over one night (09./10.09.) the
-state of charge fell from 15 % to 9 % at a steady one point per 79 to 80
-minutes — about 38 W on a 5 kWh pack. Remarkably linear across six hours.
+feeding, but it keeps draining the battery. Two nights measured at 14–15 %
+state of charge, one with the off-grid socket energised and one without:
 
-The socket was live throughout: DP 135 sat between 231 and 236 V while DP 140
-read 0 A. So the inverter was running an AC output for a socket with nothing
-in it. How much of the 38 W that accounts for is exactly what the automation
-below is meant to measure.
+| Night | Off-grid socket | Minutes per point | Self-consumption |
+|---|---|---|---|
+| 09./10.09. | on | 79–80 (six transitions) | ~15.6 W |
+| 11./12.09. | off | 285 (one transition) | ~4.3 W |
+
+The energised socket therefore costs roughly **11 W**, about 70 % of the idle
+draw — for an output with nothing plugged into it. Over a twelve-hour night
+that is around 130 Wh, more than the pack still holds at 15 %.
+
+A percentage point is `BATT_WH / 100`, so 20.5 Wh with the default of 2048.
+Watch the numbers: an earlier revision of this document put the figure at 38 W
+because it assumed a 5 kWh pack.
+
+Two caveats. The 4.3 W rest on a single percentage point against six for the
+15.6 W, so the exact value is provisional. And both runs sit at 14–15 %, where
+the LiFePO4 curve is flat and the BMS estimate of one point is coarse.
 
 Worth being clear about: the discharge stop protects the battery from the
 *controller*, not from the device itself. Over a long spell of bad weather the
 pack keeps draining below it.
+
+To repeat the measurement, no extra sensors are needed. Take the state of
+charge while the device sits in standby and time one percentage point. Use
+DP 140 to confirm which state the socket was actually in — it reads 0 only when
+the output is off.
 
 ## Switching it off overnight
 
