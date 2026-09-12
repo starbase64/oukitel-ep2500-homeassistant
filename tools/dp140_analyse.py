@@ -71,10 +71,10 @@ def main():
 
     haeufig = collections.Counter(n for _, _, n, _ in uebergaenge)
     print("Beobachtete Werte:")
-    for wert, anzahl in sorted(haeufig.items(),
+    for wert, count in sorted(haeufig.items(),
                                key=lambda x: int(x[0]) if x[0].isdigit() else 999):
         bits = f"{int(wert):04b}" if wert.isdigit() else "?"
-        print(f"   {wert:>3}  = binaer {bits}   ({anzahl}x)")
+        print(f"   {wert:>3}  = binaer {bits}   ({count}x)")
     print()
 
     kopf = f"{'Zeit':<9}{'von':>4}{'nach':>6}  " + "  ".join(
@@ -92,10 +92,10 @@ def main():
         gruppen[neu].append(z)
 
     for wert in sorted(gruppen, key=lambda x: int(x) if x.isdigit() else 999):
-        eintraege = gruppen[wert]
-        print(f"\n  DP 140 = {wert}  ({len(eintraege)}x)")
+        entries = gruppen[wert]
+        print(f"\n  DP 140 = {wert}  ({len(entries)}x)")
         for dp, name in FELDER:
-            vorkommen = {kurz(z.get(dp)) for z in eintraege}
+            vorkommen = {kurz(z.get(dp)) for z in entries}
             if len(vorkommen) == 1:
                 print(f"     {name:<10} immer {vorkommen.pop()}")
             else:

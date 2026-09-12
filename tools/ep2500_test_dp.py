@@ -103,7 +103,7 @@ def main():
                 print(f"   Versuch {versuch + 1}: DP {dp} = {ist}, wiederhole")
             else:
                 print(f"   CAUTION: restore not confirmed. "
-                      f"DP {dp} manuell auf {alt} pruefen!")
+                      f"DP {dp} manuell auf {alt} check!")
             snap("Ende")
 
 
