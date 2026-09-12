@@ -34,7 +34,7 @@ Regulation holds the grid connection at ±4 W.
   a sensor a fault sits there unnoticed for days
 - Optional Home Assistant automation that switches the off-grid socket off
   overnight. The device keeps the socket energised at idle, and standby draw
-  measured out at roughly 38 W — see "The off-grid socket" in
+  measured at about 11 W for the socket alone — see "The off-grid socket" in
   [docs/setup.md](docs/setup.md), YAML in `homeassistant/offgrid_night.yaml`
 - **Log recording from the dashboard**: a switch starts mirroring the bridge's
   log into a file, and the bridge serves the recordings over HTTP so you can
