@@ -8,8 +8,11 @@
 # Written in the triggers/conditions/actions syntax used by Home Assistant
 # 2024.10 and later. On older versions use trigger/condition/action instead.
 #
-# Entity IDs are from a default install. If yours differ, look them up under
-# Developer tools > States and adjust.
+# Entity IDs are from a fresh install. On an installation that started out
+# with German entity names they differ - the socket is then
+# switch.oukitel_ep2500_off_grid_steckdose, and the automation silently does
+# nothing until it is corrected. Check under Developer tools > States, or run
+# tools/fix_dashboard_ids.py to see the mapping your install uses.
 
 - id: ep2500_offgrid_sunset
   alias: EP2500 - off-grid socket off at sunset
