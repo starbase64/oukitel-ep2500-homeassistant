@@ -243,65 +243,29 @@ when a new recording starts. `REC_MAX_MB` closes a recording that grows past
 the limit rather than filling the disk. Mount `REC_DIR` as a volume, otherwise
 the recordings disappear with the next container rebuild.
 
-## A negative meter target and a second AC storage
+## Per-phase readings
 
-A negative meter target tells the controller to keep a deliberate export at
-the meter. That is how you feed an AC-coupled storage unit that only starts
-charging when it sees surplus.
+The Eco Tracker reports the balanced sum and each phase separately. The
+zero-export controller keeps using its own averaged value, unchanged; the
+phases are a separate, smoothed set used for the checks described in Part 7.
 
-Left alone, that would run away. The EP2500 exports to create surplus, the
-other unit absorbs it, the meter reads zero again, so the EP2500 exports more.
-Both units ramp until one of them hits its limit.
+Two things they give you that the sum cannot. **What else sits on the device's
+phase**: subtracting the EP2500's own contribution (DP 137) from its phase
+leaves everything else, which may well be feeding rather than consuming.
+**Where compensation happens**: when the sum does not follow a change, the
+phases show which one moved instead.
 
-The Shelly plugs in front of the AC storage units break that loop. Their
-measured charging power is subtracted from the request, so the target only
-asks for what is not already being absorbed:
+Set the phase the EP2500 is wired to from the dashboard; the default is 1.
+
+A line lands in the log once a minute:
 
 ```
-requested -300 W, storage charging 0 W    -> effective target -300 W
-requested -300 W, storage charging 100 W  -> effective target -200 W
-requested -300 W, storage charging 300 W  -> effective target    0 W
-requested -300 W, storage charging 500 W  -> effective target    0 W
+Phases | L1  +603 | L2   +87 | L3  -334 | sum  +356 W | own L1, others -124 W
 ```
 
-The contribution is capped at the request, so the compensation can never turn
-an export request into an import one.
-
-Two guards sit around it. A reading older than `AC_STORAGE_MAX_AGE` or a
-Shelly whose relay is off means the surplus has no taker, so the negative
-target is suspended and the controller falls back to zero export. And
-`AC_STORAGE_NOISE` ignores the few watts a plug reports when nothing is
-charging.
-
-### Worked example
-
-Discharge stop 15 %, pass-through target 90 %, meter target -300 W, one AC
-storage on a Shelly. PV is strong.
-
-| Step | Meter | Storage | Effective target | EP2500 export | Why |
-|---|---|---|---|---|---|
-| 1 | +40 W | 0 W | -300 W | rises | surplus has to be created first |
-| 2 | -290 W | 0 W | -300 W | steady | the other unit has not noticed yet |
-| 3 | -180 W | 110 W | -190 W | steady | it started; the request shrinks by what it takes |
-| 4 | -10 W | 290 W | -10 W | steady | nearly everything is absorbed |
-| 5 | 0 W | 300 W | 0 W | steady | balance reached, no runaway |
-| 6 | +260 W | 0 W | -300 W | rises | the other unit is full and stopped |
-
-Nothing escalates in step 5 because the export the EP2500 produces shows up in
-the Shelly reading and is deducted again.
-
-### What happens when the EP2500's own battery fills up
-
-Pass-through would pin the export limit at `LIMIT_MAX`, which overrides your
-meter target. It therefore stays out of the way while a target is set — but
-only up to a point. `PASS_OVERRIDE` points above the pass-through target,
-protection wins and pass-through engages anyway, with an event saying so.
-
-With the defaults that means: at 90 % nothing happens beyond a note in the
-event log that protection is being held back. At 93 % pass-through takes over
-and the meter target is suspended until the state of charge is back at 90 %.
-Running the device into its 100 % shutdown costs far more harvest than missing
-a meter target for half an hour.
+`PHASE_LOG_INTERVAL` controls the cadence, 0 turns it off. The readings also
+go to Home Assistant continuously, but the recordings are what you read
+afterwards when working out why the controller did what it did.
 
 ## Pass-through: how it holds the state of charge
 
@@ -458,33 +422,132 @@ The meter hovers around zero, the feed-in limit follows your consumption, and
 on PV surplus it drops back to 0 so the battery charges. Direction changes and
 faults show up in the event log.
 
-## 7.4 Charging another AC storage without controller ramp-up
+## 7.4 Charging a second AC storage, and why it needs a guard
 
-A fixed negative grid target alone creates a feedback problem: with a target
-of `-300 W`, the other storage absorbs the first 300 W and the grid meter moves
-back towards zero. A controller that only sees the grid meter then raises the
-EP2500 output again.
+A negative meter target keeps a deliberate export so a neighbouring
+AC-coupled storage unit sees surplus and starts charging.
 
-The two optional AC-storage Shelly inputs remove that feedback. For a negative
-requested target the bridge uses:
+Left alone this runs away. The neighbour absorbs the export, the meter returns
+towards zero, the controller gives more, the neighbour takes more. Both ramp
+until one hits its ceiling. Measured on 12.09. with a target of -300 W and a
+Bluetti Balco260 brought onto phase 3:
 
-```text
-effective meter target = requested target + measured AC-storage charging power
+```
+L1  -286 | L3   +11 | sum  -265 W    neighbour not connected yet
+L1  -384 | L3  +267 | sum  -108 W    neighbour absorbing
+L1  -739 | L3  +673 | sum   -55 W    neighbour absorbing nearly all
 ```
 
-The measured contribution is clamped to the requested export. With `-300 W`
-requested, 100 W of storage charging produces an effective meter target of
-`-200 W`; at 300 W charging the effective target is `0 W`. The sum of captured
-charging power and remaining grid export therefore stays at 300 W instead of
-ramping indefinitely.
+L1 fell by 453 W, L3 rose by 662 W, and the balanced sum moved the wrong way.
+Export reached the 800 W ceiling and the EP2500 ended up discharging its own
+battery into the neighbour.
 
-If at least one AC-storage Shelly is configured but no enabled unit has a fresh
-measurement, the bridge temporarily changes a negative target to `0 W`. It
-will not deliberately export blind. The original negative-target behaviour is
-retained when no AC-storage Shelly is configured at all.
+**The meter alone cannot tell the two cases apart.** Whether a phase reads
+negative because of PV surplus or because a battery is discharging looks
+identical. What does work is checking whether the meter follows the device's
+own change: raise export by one step, wait, and see whether the balanced sum
+moved down by a fair share of what was actually put out.
 
-Pass-through is suspended while a non-zero meter target is active because its
-fixed-output strategy would otherwise override this controller.
+Raising export is therefore a probe; lowering is free and immediate. If the
+sum does not follow, the export ceiling stays at the value from before the
+step and an event says why:
+
+```
+Negative meter target capped at 285 W - exported +132 W more but the meter
+only moved +1 W (1 %), so something else is absorbing it
+```
+
+Changing the target releases the cap.
+
+Be clear about what this does and does not achieve. It stops the escalation.
+It cannot make the neighbour take exactly the amount you asked for - that unit
+takes what it sees, and with a balanced meter the target is simply not
+reachable while another controller works against it. Hitting a precise figure
+would need a measurement at the neighbour's connection, which is exactly the
+dependency this project avoids.
+
+`PROBE_SETTLE` has to outlast the neighbour's reaction. See "How long a
+neighbour takes to react" below.
+
+---
+
+## How long a neighbour takes to react
+
+Anything that judges its own effect on the meter has to wait longer than the
+other controller needs to respond. Measured on 12.09. against a Hoymiles
+4020X on another phase, with the EP2500 drawing 741 W:
+
+| Time after the step | Neighbour covering | Share still at the meter |
+|---|---|---|
+| 19 s | nothing | 74 % |
+| 79 s | 640 W | 14 % |
+
+A verdict at 25 seconds would have read "genuine" and walked straight into the
+loop. `PROBE_SETTLE` therefore defaults to 90 seconds. The response time also
+varies - in a second run the neighbour had already reacted after 19 seconds -
+so do not tune this to the shortest observation you happen to make.
+
+---
+
+## Backup charging
+
+One switch, manual only. It pauses the controller, writes `backup_power` to
+DP 165, and sets DP 122 to the configured power. The device then charges from
+the grid unconditionally, regardless of the meter.
+
+It stops by itself at the charge stop, because leaving the device sitting at
+100 % costs harvest for hours. Switching it off restores the mode, the
+previous charge limit and the controller.
+
+Measured throughput: 800 W from the grid produces about 727 W into the
+battery, so roughly 91 % conversion.
+
+---
+
+## AC surplus charging
+
+The mirror image of the section above: instead of creating export for someone
+else, the EP2500 absorbs surplus nobody else is taking.
+
+It uses the same probe. Confirmation takes two minutes before it engages, then
+the charge limit rises one step per `PROBE_SETTLE`, each step verified. Coming
+down is immediate and never waits. That makes the loop asymmetric in the safe
+direction and deliberately unhurried.
+
+If a neighbouring battery is producing the "surplus", the probe sees it within
+one step and stops:
+
+```
+AC surplus charging stopped - another source compensated: drew +150 W,
+meter moved +0 W (0 %)
+```
+
+Surplus charging and a negative meter target cancel each other out - one
+creates export, the other absorbs it. Running both is a loop, so the
+combination is refused rather than silently prioritised.
+
+Priority overall: backup beats everything, then pass-through, then surplus
+charging, then zero-export control.
+
+---
+
+## The Shelly plugs
+
+Up to four are supported. **None of them feeds the control loop.** They exist
+for two things: watching power independently of what the device reports, and
+cutting a unit from mains remotely when something goes wrong.
+
+| Slot | Typical use |
+|---|---|
+| `SHELLY_IP` | in front of the EP2500 - independent check on DP 155, and a hard mains disconnect |
+| `SHELLY2_IP` | a second PV system or another device worth watching |
+| `AC_STORAGE1_IP`, `AC_STORAGE2_IP` | AC-coupled storage units - remote emergency shutdown |
+
+The addresses are editable from the dashboard and stored as retained MQTT, so
+they survive a restart. Leave one empty and that slot is simply inactive.
+
+Switching the first one off disconnects the EP2500 from mains, and the bridge
+loses its connection while it is off - that is the point of it.
 
 ---
 
@@ -508,6 +571,15 @@ Whether it also accepts export, from a balcony PV system for example, I have
 not tested. On the type plate the off-grid terminal is listed as output only.
 
 ## The switch shows the permission, not the state
+
+The dashboard therefore carries two entries. **Off-grid socket (permission)**
+is DP 119, what you asked for. **Off-grid output live** is derived from DP 140
+and says whether current is actually flowing.
+
+They come apart in practice. Measured on 13.09.: DP 140 dropped to 0 while
+DP 119 stayed on and was never written - the device withdrew the output on its
+own as the battery ran down. Without the second entry the dashboard shows a
+socket that has been dead for an hour.
 
 DP 119 is the setting "off-grid output enabled". It is not a readout of
 whether the socket is actually live. The device can have the output shut down
@@ -551,8 +623,9 @@ state of charge, one with the off-grid socket energised and one without:
 |---|---|---|---|
 | 09./10.09. | on | 79–80 (six transitions) | ~15.6 W |
 | 11./12.09. | off | 285 (one transition) | ~4.3 W |
+| 12./13.09. | off | over 328, no transition at all | under 3.8 W |
 
-The energised socket therefore costs roughly **11 W**, about 70 % of the idle
+The energised socket therefore costs roughly **12 W**, about 70 % of the idle
 draw — for an output with nothing plugged into it. Over a twelve-hour night
 that is around 130 Wh, more than the pack still holds at 15 %.
 
@@ -560,8 +633,9 @@ A percentage point is `BATT_WH / 100`, so 20.5 Wh with the default of 2048.
 Watch the numbers: an earlier revision of this document put the figure at 38 W
 because it assumed a 5 kWh pack.
 
-Two caveats. The 4.3 W rest on a single percentage point against six for the
-15.6 W, so the exact value is provisional. And both runs sit at 14–15 %, where
+One caveat. The two figures with the socket off rest on very little: one
+percentage point in the first case and none at all in the second, which only
+gives an upper bound. Both agree that it is under 5 W. And both runs sit at 14–15 %, where
 the LiFePO4 curve is flat and the BMS estimate of one point is coarse.
 
 Worth being clear about: the discharge stop protects the battery from the
@@ -673,6 +747,12 @@ use `trigger:`, `condition:` and `action:` in the singular.
 The startup trigger also aligns the socket after a Home Assistant restart.
 Disabling the helper restores the socket immediately, while sunrise restores
 it only if automatic night switching is still enabled.
+
+**Check the entity ID before relying on it.** An automation that points at an
+entity which does not exist fails silently - no error, no log line, nothing
+happens at sunset. On an installation upgraded from German entity names the
+socket is `switch.oukitel_ep2500_off_grid_steckdose`, not `..._off_grid_socket`.
+Developer tools > States tells you which one you have.
 
 The `logbook.log` entries are optional. They make it easy to line up a
 measurement night with what actually happened.

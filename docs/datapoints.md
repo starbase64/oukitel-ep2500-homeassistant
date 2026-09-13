@@ -43,9 +43,11 @@ active. It is the PV charge power actually in effect. No separate datapoint was
 found for PV charge power 1 – possibly identical with 156.
 
 **Note on DP 119 – off-grid socket:** this is the permission, not the state.
-The device releases the output only once the state of charge is five points
-above the discharge stop (DP 124). Below that it acknowledges a write and
-leaves the socket dead. DP 119 also only appears in the log when it *changes*,
+The device normally releases the output once the state of charge is about five
+points above the discharge stop (DP 124); below that it acknowledges a write
+and leaves the socket dead. Treat that as a guide, not a law: on 13.09. the
+output came up at 19 % with a discharge stop of 15. Use DP 140 to find out
+what actually happened rather than predicting from the state of charge. DP 119 also only appears in the log when it *changes*,
 so its silence says nothing about the current state.
 
 **DP 140 (off-grid output current) is the readout that does tell you.** With
@@ -96,8 +98,9 @@ equals 20.5 Wh:
 |---|---|---|---|
 | 09./10.09. | on | 79–80 (six transitions) | ~15.6 W |
 | 11./12.09. | off | 285 (one transition) | ~4.3 W |
+| 12./13.09. | off | over 328, no transition | under 3.8 W |
 
-So the energised socket costs roughly 11 W, about 70 % of the idle draw.
+So the energised socket costs roughly 12 W, about 70 % of the idle draw.
 `homeassistant/offgrid_night.yaml` switches it off between sunset and sunrise;
 details in [setup.md](setup.md), section "The off-grid socket".
 
