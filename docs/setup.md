@@ -257,6 +257,11 @@ phases show which one moved instead.
 
 Set the phase the EP2500 is wired to from the dashboard; the default is 1.
 
+**Requires `GRID_SOURCE=http`.** The per-phase values come from the Eco
+Tracker's own endpoint. With `GRID_SOURCE=mqtt` only the balanced total
+arrives, so the phase display and AC surplus charging stay inactive; the
+bridge says so at startup.
+
 A line lands in the log once a minute:
 
 ```
@@ -527,7 +532,15 @@ creates export, the other absorbs it. Running both is a loop, so the
 combination is refused rather than silently prioritised.
 
 Priority overall: backup beats everything, then pass-through, then surplus
-charging, then zero-export control.
+charging, then zero-export control. Surplus charging hands over at the
+pass-through threshold rather than at the charge stop - carrying on past it
+would walk the battery into the 100 % shutdown that pass-through exists to
+prevent.
+
+If the meter goes quiet, surplus charging stops. It refuses to act on a
+reading older than `GRID_MAX_AGE`, because a frozen value would otherwise let
+it keep raising the charge limit against a meter that has said nothing for
+hours.
 
 ---
 
