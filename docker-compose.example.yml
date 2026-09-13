@@ -46,6 +46,11 @@ services:
 
       # --- optional: Shelly plugs for cross-checking ------------------
       SHELLY_IP:    ""
+      # Shelly plugs in front of AC-coupled storage units. Switches only -
+      # a way to cut them from mains remotely. Not used by the controller.
+      AC_STORAGE1_IP: ""
+      AC_STORAGE2_IP: ""
+      SHELLY_STALE_AFTER: "5"
       SHELLY2_IP:   ""
       # Shelly plugs measuring the input of up to two AC-coupled stores.
       # These can also be entered later in Home Assistant.
@@ -66,6 +71,8 @@ services:
       PROBE_SETTLE: "90"
       PROBE_ACCEPT: "0.6"
       SURPLUS_STEP: "200"
+      # Same probe, mirrored, for a negative meter target.
+      NEG_PROBE_STEP: "150"
       SURPLUS_ENTER_W: "100"
       SURPLUS_ENTER_S: "120"
       SURPLUS_EXIT_S: "90"
@@ -77,10 +84,6 @@ services:
       NEIGHBOUR_FIELD: "bat_p"
       NEIGHBOUR_SIGN: "discharge_positive"
 
-      AC_STORAGE1_IP: ""
-      AC_STORAGE2_IP: ""
-      AC_STORAGE_MAX_AGE: "15"
-      AC_STORAGE_NOISE: "5"
       # Margin above the discharge stop at which the device releases the
       # off-grid output again. 5 on the unit this was written for.
       OFFGRID_SOC_MARGIN: "5"

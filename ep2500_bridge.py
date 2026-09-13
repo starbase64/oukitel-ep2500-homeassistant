@@ -70,18 +70,19 @@ ECO_SPIKE = int(os.getenv("ECO_SPIKE", "600"))
 # AC power, and a hard on/off switch.
 SHELLY_IP = os.getenv("SHELLY_IP", "")
 SHELLY_INTERVAL = int(os.getenv("SHELLY_INTERVAL", "5"))
+# Failed polls before a Shelly's reading is dropped instead of left standing.
+SHELLY_STALE_AFTER = int(os.getenv("SHELLY_STALE_AFTER", "5"))
 
 # Second Shelly, for example on a north-facing balcony PV system. Leave empty
 # if you do not have one.
 SHELLY2_IP = os.getenv("SHELLY2_IP", "")
 
-# Optional Shelly plugs in front of up to two AC-coupled storage units. Their
-# charging power is removed from a negative meter target so the EP2500 does
-# not keep increasing its output while the other storage absorbs the surplus.
+# Shelly plugs in front of AC-coupled storage units. These are switches only -
+# a way to cut those units from mains remotely. Their readings deliberately do
+# not feed the controller: that runs on the meter phases alone, so the bridge
+# stays usable without any knowledge of the neighbouring hardware.
 AC_STORAGE1_IP = os.getenv("AC_STORAGE1_IP", "")
 AC_STORAGE2_IP = os.getenv("AC_STORAGE2_IP", "")
-AC_STORAGE_MAX_AGE = float(os.getenv("AC_STORAGE_MAX_AGE", "15"))
-AC_STORAGE_NOISE = float(os.getenv("AC_STORAGE_NOISE", "5"))
 
 # Usable capacity for the runtime estimate. Per the type plate,
 # 51.2 V x 40 Ah = 2048 Wh.
@@ -189,6 +190,20 @@ PHASE_LOG_INTERVAL = int(os.getenv("PHASE_LOG_INTERVAL", "60"))
 PROBE_SETTLE = int(os.getenv("PROBE_SETTLE", "90"))   # s before judging a step
 PROBE_ACCEPT = float(os.getenv("PROBE_ACCEPT", "0.6"))  # share the meter must follow
 PROBE_MIN_DRAW = int(os.getenv("PROBE_MIN_DRAW", "60"))  # W; below this no verdict
+
+# The same test, mirrored, for a negative meter target. That target asks for
+# deliberate export so another storage unit charges - and it has exactly the
+# opposite failure mode: the other unit absorbs everything, the meter never
+# reaches the target, and this one keeps giving more until it hits LIMIT_MAX.
+#
+# Measured on 12.09. with a Bluetti Balco260 brought onto phase 3 while the
+# target was -300 W: over two minutes L1 fell by 453 W and L3 rose by 662 W,
+# while the balanced sum moved from -265 W to -55 W - the wrong way. Export
+# ran to the 800 W ceiling and the EP2500 ended up discharging its own
+# battery into the neighbour.
+#
+# The rule is the same as for surplus: raising is a probe, lowering is free.
+NEG_PROBE_STEP = int(os.getenv("NEG_PROBE_STEP", "150"))  # W per verified step
 
 SURPLUS_ENTER_W = int(os.getenv("SURPLUS_ENTER_W", "100"))
 SURPLUS_ENTER_S = int(os.getenv("SURPLUS_ENTER_S", "120"))
@@ -706,6 +721,7 @@ class State:
         self.idle_logged = False   # idle lock already reported?
         self.idle_since = 0.0      # last seen idle
         self.offgrid_reported = False
+        self.offgrid_since = 0.0   # since when is the output dead?
         self.fault_reported = None  # DP 149 value last reported as an event
         self.pass_on = False       # pass-through enabled?
         self.pass_active = False   # pass-through running right now?
@@ -734,6 +750,11 @@ class State:
         self.probe_meter = None     # smoothed sum before the step
         self.probe_draw = None      # DP 137 before the step
         self.phase_logged = 0.0     # when the phases were last written out
+        self.neg_probe_at = 0.0     # running probe for a negative target
+        self.neg_probe_sum = None   # smoothed sum before the step
+        self.neg_probe_out = None   # DP 155 before the step
+        self.neg_probe_limit = None  # export limit before the step
+        self.neg_cap = None         # export ceiling a failed probe imposed
         self.setpoint = 0.0            # internal setpoint: >0 export, <0 charge
         self.events = []           # event list for the dashboard
         self.last_status = None    # previous device status (for events)
@@ -757,7 +778,6 @@ class State:
         self.ac_storage2_on = None
         self.ac_storage2_ts = 0.0
         self.ac_storage2_fails = 0
-        self.ac_storage_wait = False
 
     def tune_get(self, key):
         """Reads a controller parameter under the lock."""
@@ -1003,61 +1023,6 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Shelly plugs measuring AC-coupled storage charging power. Their relay
-    # switches remain directly controllable from Home Assistant.
-    for nr in (1, 2):
-        key = f"ac_storage{nr}"
-        label = f"AC storage {nr}"
-        client.publish(f"{DISC}/sensor/ep2500/{key}/config", json.dumps({
-            "name": f"{label} charging power",
-            "unique_id": f"ep2500_{key}_power",
-            "state_topic": f"{BASE}/{key}",
-            "value_template": "{{ value_json.power }}",
-            "unit_of_measurement": "W",
-            "device_class": "power",
-            "state_class": "measurement",
-            "icon": "mdi:battery-charging",
-            "availability_topic": f"{BASE}/available",
-            "device": DEVICE_INFO,
-        }), retain=True)
-        client.publish(f"{DISC}/switch/ep2500/{key}/config", json.dumps({
-            "name": label,
-            "unique_id": f"ep2500_{key}_switch",
-            "state_topic": f"{BASE}/{key}",
-            "value_template": "{{ value_json.state }}",
-            "command_topic": f"{BASE}/{key}/set",
-            "payload_on": "ON", "payload_off": "OFF",
-            "icon": "mdi:battery-arrow-up",
-            "availability_topic": f"{BASE}/available",
-            "device": DEVICE_INFO,
-        }), retain=True)
-        client.publish(f"{DISC}/text/ep2500/{key}_ip/config", json.dumps({
-            "name": f"{label} Shelly IP",
-            "unique_id": f"ep2500_{key}_ip",
-            "state_topic": f"{BASE}/{key}_ip",
-            "command_topic": f"{BASE}/{key}_ip/set",
-            "max": 15,
-            "icon": "mdi:ip-network",
-            "entity_category": "config",
-            "availability_topic": f"{BASE}/available",
-            "device": DEVICE_INFO,
-        }), retain=True)
-
-    for key, name in (
-            ("ac_storage_charge_power", "AC storage charging power total"),
-            ("meter_target_effective", "Effective meter target")):
-        client.publish(f"{DISC}/sensor/ep2500/{key}/config", json.dumps({
-            "name": name,
-            "unique_id": f"ep2500_{key}",
-            "state_topic": f"{BASE}/state",
-            "value_template": "{{ value_json." + key + " }}",
-            "unit_of_measurement": "W",
-            "device_class": "power",
-            "state_class": "measurement",
-            "availability_topic": f"{BASE}/available",
-            "device": DEVICE_INFO,
-        }), retain=True)
-
     # The device's own SoC limits
     for key, dp, name, icon in (
             ("socmax", DP_SOC_MAX, "Charge stop", "mdi:battery-charging-high"),
@@ -1233,6 +1198,63 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
+    # Whether the off-grid output is actually delivering. The switch above
+    # shows DP 119, which is the permission - the device can withdraw the
+    # output on its own without touching it. Measured on 13.09.: DP 140 went
+    # to 0 while DP 119 stayed on, so the dashboard kept showing a socket that
+    # had been dead for an hour.
+    client.publish(f"{DISC}/binary_sensor/ep2500/offgrid_live/config",
+                   json.dumps({
+        "name": "Off-grid output live",
+        "unique_id": "ep2500_offgrid_live",
+        "state_topic": f"{BASE}/state",
+        "value_template": "{{ 'ON' if value_json.offgrid_live else 'OFF' }}",
+        "payload_on": "ON", "payload_off": "OFF",
+        "device_class": "running",
+        "icon": "mdi:power-socket-de",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
+
+    # Shelly plugs in front of AC-coupled storage units. Switches and address
+    # fields only - the power reading is shown because the plug measures it
+    # anyway, but nothing in the control loop reads it.
+    for nr, key in ((1, "ac_storage1"), (2, "ac_storage2")):
+        client.publish(f"{DISC}/switch/ep2500/{key}/config", json.dumps({
+            "name": f"Shelly at AC storage {nr}",
+            "unique_id": f"ep2500_{key}_switch",
+            "state_topic": f"{BASE}/{key}",
+            "value_template": "{{ value_json.state }}",
+            "command_topic": f"{BASE}/{key}/set",
+            "payload_on": "ON", "payload_off": "OFF",
+            "icon": "mdi:power-plug-battery",
+            "availability_topic": f"{BASE}/available",
+            "device": DEVICE_INFO,
+        }), retain=True)
+        client.publish(f"{DISC}/text/ep2500/{key}_ip/config", json.dumps({
+            "name": f"Shelly IP at AC storage {nr}",
+            "unique_id": f"ep2500_{key}_ip",
+            "state_topic": f"{BASE}/{key}_ip",
+            "command_topic": f"{BASE}/{key}_ip/set",
+            "max": 15,
+            "icon": "mdi:ip-network",
+            "entity_category": "config",
+            "availability_topic": f"{BASE}/available",
+            "device": DEVICE_INFO,
+        }), retain=True)
+        client.publish(f"{DISC}/sensor/ep2500/{key}/config", json.dumps({
+            "name": f"AC storage {nr} power",
+            "unique_id": f"ep2500_{key}_power",
+            "state_topic": f"{BASE}/{key}",
+            "value_template": "{{ value_json.power }}",
+            "unit_of_measurement": "W",
+            "device_class": "power",
+            "state_class": "measurement",
+            "entity_category": "diagnostic",
+            "availability_topic": f"{BASE}/available",
+            "device": DEVICE_INFO,
+        }), retain=True)
+
     # Recording: switch and status display
     client.publish(f"{DISC}/switch/ep2500/record/config", json.dumps({
         "name": "Record log",
@@ -1291,11 +1313,13 @@ def publish_discovery(client):
         client.publish(f"{DISC}/number/ep2500/tune_{key}/config",
                        json.dumps(cfg), retain=True)
 
-    # Remove retired entities (on empty payload deletes them in HA)
-    for path_ in ("switch/ep2500/gridcharge", "number/ep2500/tune_charge_max",
-                 "number/ep2500/tune_hyst", "sensor/ep2500/pv_strings",
-                 "number/ep2500/tune_pass_marge",
-                 "binary_sensor/ep2500/offgrid_live"):
+    # Remove retired entities (an empty payload deletes them in HA)
+    retired = ["switch/ep2500/gridcharge", "number/ep2500/tune_charge_max",
+               "number/ep2500/tune_hyst", "sensor/ep2500/pv_strings",
+               "number/ep2500/tune_pass_marge",
+               "sensor/ep2500/ac_storage_charge_power",
+               "sensor/ep2500/meter_target_effective"]
+    for path_ in retired:
         client.publish(f"{DISC}/{path_}/config", "", retain=True)
 
     log.info("Discovery published")
@@ -1310,10 +1334,10 @@ def on_connect(client, userdata, flags, rc, properties=None):
               f"{BASE}/socmax/set", f"{BASE}/socmin/set",
               f"{BASE}/shelly_ip/set", f"{BASE}/shelly/set",
               f"{BASE}/shelly2_ip/set", f"{BASE}/shelly2/set",
-              f"{BASE}/phase/set", f"{BASE}/backup/set",
-              f"{BASE}/backup/power/set", f"{BASE}/surplus/set",
               f"{BASE}/ac_storage1_ip/set", f"{BASE}/ac_storage1/set",
               f"{BASE}/ac_storage2_ip/set", f"{BASE}/ac_storage2/set",
+              f"{BASE}/phase/set", f"{BASE}/backup/set",
+              f"{BASE}/backup/power/set", f"{BASE}/surplus/set",
               f"{BASE}/offgrid/set", f"{BASE}/record/set"):
         client.subscribe(t)
     if GRID_SOURCE == "mqtt":
@@ -1329,13 +1353,13 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{BASE}/passthrough/state")
     client.subscribe(f"{BASE}/shelly_ip")
     client.subscribe(f"{BASE}/shelly2_ip")
+    client.subscribe(f"{BASE}/ac_storage1_ip")
+    client.subscribe(f"{BASE}/ac_storage2_ip")
     client.subscribe(f"{BASE}/phase")
     client.subscribe(f"{BASE}/backup/power")
     client.subscribe(f"{BASE}/surplus/state")
     if NEIGHBOUR_TOPIC:
         client.subscribe(NEIGHBOUR_TOPIC)
-    client.subscribe(f"{BASE}/ac_storage1_ip")
-    client.subscribe(f"{BASE}/ac_storage2_ip")
 
     # Re-send the availability state after on MQTT reconnect, otherwise HA
     # shows the entities as permanently unavailable.
@@ -1355,6 +1379,10 @@ def publish_settings():
     # shows "empty value" even though something was in it before.
     if "shelly_ip" not in st.restored and st.shelly_ip:
         mqttc.publish(f"{BASE}/shelly_ip", st.shelly_ip, retain=True)
+    for key in ("ac_storage1", "ac_storage2"):
+        ip = getattr(st, f"{key}_ip")
+        if f"{key}_ip" not in st.restored and ip:
+            mqttc.publish(f"{BASE}/{key}_ip", ip, retain=True)
     if "phase" not in st.restored:
         mqttc.publish(f"{BASE}/phase", str(st.ep_phase), retain=True)
     if "backup_power" not in st.restored:
@@ -1366,10 +1394,6 @@ def publish_settings():
                   "ON" if st.backup_on else "OFF", retain=True)
     if "shelly2_ip" not in st.restored and st.shelly2_ip:
         mqttc.publish(f"{BASE}/shelly2_ip", st.shelly2_ip, retain=True)
-    for key in ("ac_storage1", "ac_storage2"):
-        ip = getattr(st, f"{key}_ip")
-        if f"{key}_ip" not in st.restored and ip:
-            mqttc.publish(f"{BASE}/{key}_ip", ip, retain=True)
     if "passthrough" not in st.restored:
         mqttc.publish(f"{BASE}/passthrough/state",
                       "ON" if st.pass_on else "OFF", retain=True)
@@ -1384,8 +1408,7 @@ def publish_settings():
     log.info("Shelly addresses: mains disconnect=%r  north PV=%r  "
              "AC storage 1=%r  AC storage 2=%r",
              st.shelly_ip or "(empty)", st.shelly2_ip or "(empty)",
-             st.ac_storage1_ip or "(empty)",
-             st.ac_storage2_ip or "(empty)")
+             st.ac_storage1_ip or "(empty)", st.ac_storage2_ip or "(empty)")
 
 
 def on_message(client, userdata, msg):
@@ -1435,10 +1458,9 @@ def on_message(client, userdata, msg):
             log.info("Shelly address %s (restored)", payload)
         return
 
-    for nr in (1, 2):
-        key = f"ac_storage{nr}"
+    for nr, key in ((3, "ac_storage1"), (4, "ac_storage2")):
         if topic == f"{BASE}/{key}/set":
-            shelly_switch(payload.upper() == "ON", nr=nr + 2)
+            shelly_switch(payload.upper() == "ON", nr=nr)
             return
         if topic == f"{BASE}/{key}_ip/set":
             ip = payload.strip()
@@ -1448,14 +1470,15 @@ def on_message(client, userdata, msg):
             setattr(st, f"{key}_ts", 0.0)
             st.restored.add(f"{key}_ip")
             client.publish(f"{BASE}/{key}_ip", ip, retain=True)
-            event(f"AC storage {nr} Shelly address changed to {ip or '(empty)'}")
+            event(f"Shelly at AC storage {nr - 2}: address changed to "
+                  f"{ip or '(empty)'}")
             return
         if topic == f"{BASE}/{key}_ip":
             if f"{key}_ip" not in st.restored and payload:
                 setattr(st, f"{key}_ip", payload)
                 st.restored.add(f"{key}_ip")
-                log.info("AC storage %s Shelly address %s (restored)",
-                         nr, payload)
+                log.info("Shelly at AC storage %s: address %s (restored)",
+                         nr - 2, payload)
             return
 
     if topic == f"{BASE}/shelly2/set":
@@ -1663,12 +1686,14 @@ def on_message(client, userdata, msg):
         if ok:
             event("Off-grid socket "
                   + ("switched on" if on else "switched off"))
-            locked, soc, threshold = offgrid_locked(st.snapshot())
-            if on and locked:
-                # The device accepts the command but does not carry it out.
-                # Without this note it looks like a bug in the bridge.
-                event(f"Note: state of charge {soc} %, the output only returns at "
-                      f"{threshold} % (discharge stop +{OFFGRID_SOC_MARGIN})")
+            # No prediction here. Whether the output really comes up is
+            # something only DP 140 can answer, and offgrid_watch_loop checks
+            # it after a settling period. Guessing from the state of charge
+            # produced a false alarm on 13.09. - twelve seconds before the
+            # current actually started flowing.
+            if on:
+                st.offgrid_since = 0.0
+                st.offgrid_reported = False
             # The cache now holds the requested value. Whether the device
             # really took it only shows on a read-back.
             threading.Timer(VERIFY_DELAY, verify_switch,
@@ -1737,6 +1762,7 @@ def on_message(client, userdata, msg):
             st.correction = clamp_meter_target(val)
             st.restored.add("correction")
             client.publish(f"{BASE}/correction/state", st.correction, retain=True)
+            st.neg_cap, st.neg_probe_at, st.neg_probe_limit = None, 0.0, None
             log.info("Meter target = %s W", st.correction)
             event(f"Meter target set to {st.correction:+d} W")
 
@@ -1791,56 +1817,6 @@ def calculate_setpoint(grid, target, actual, current, gain, max_step):
     current = min(actual + WINDUP_MARGIN, current)
     current += max(-max_step, min(max_step, error * gain))
     return max(0.0, min(float(LIMIT_MAX), current))
-
-
-def compensated_meter_target(requested, storage_power, ready=True,
-                             compensation_enabled=True):
-    """Offsets a negative meter target by AC-storage charging power.
-
-    Example: requested -300 W and 100 W measured charging gives an effective
-    meter target of -200 W. At 300 W charging the effective target is 0 W.
-    The contribution is capped, so it can never turn the request into import
-    or create a positive feedback ramp.
-    """
-    requested = float(requested)
-    if requested >= 0 or not compensation_enabled:
-        return requested
-    if not ready:
-        return 0.0
-    absorbed = min(-requested, max(0.0, float(storage_power)))
-    return min(0.0, requested + absorbed)
-
-
-def ac_storage_charge_power(now=None):
-    """Returns (watts, ready, configured) for enabled AC-storage Shellys."""
-    now = time.time() if now is None else now
-    total = 0.0
-    configured = False
-    active = False
-    with st.lock:
-        values = [
-            (st.ac_storage1_ip, st.ac_storage1_power,
-             st.ac_storage1_on, st.ac_storage1_ts),
-            (st.ac_storage2_ip, st.ac_storage2_power,
-             st.ac_storage2_on, st.ac_storage2_ts),
-        ]
-
-    for ip, power, on, timestamp in values:
-        if not ip:
-            continue
-        configured = True
-        if on is False:
-            continue
-        active = True
-        if (not isinstance(power, (int, float))
-                or now - timestamp > AC_STORAGE_MAX_AGE):
-            return 0.0, False, True
-        if power > AC_STORAGE_NOISE:
-            total += power
-
-    # If Shellys are configured but all their relays are off, do not create
-    # deliberate grid export that no storage unit can absorb.
-    return total, (not configured or active), configured
 
 
 mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ep2500-bridge")
@@ -1997,11 +1973,7 @@ def publish_state():
         out["charge"] = dps[DP_CHARGE]
     out["setpoint"] = int(round(st.setpoint))
     out["passthrough"] = st.pass_active
-    storage_power, storage_ready, storage_configured = ac_storage_charge_power()
-    out["ac_storage_charge_power"] = round(storage_power)
     out["meter_target"] = st.correction
-    out["meter_target_effective"] = round(compensated_meter_target(
-        st.correction, storage_power, storage_ready, storage_configured))
     error = dps.get("149")
     fault_txt, fault_serious = fault_text(error)
     out["fault"] = error if isinstance(error, int) else 0
@@ -2023,6 +1995,9 @@ def publish_state():
     out["charge_setpoint"] = int(st.charge_setpoint)
     if DP_OFFGRID in dps:
         out["offgrid"] = bool(dps[DP_OFFGRID])
+    current = dps.get("140")
+    out["offgrid_live"] = (bool(current) if isinstance(current, (int, float))
+                           else None)
     if DP_BACKFLOW in dps:
         out["backflow"] = bool(dps[DP_BACKFLOW])
     if DP_SOC_MAX in dps:
@@ -2317,8 +2292,8 @@ def shelly_slot(nr):
     slots = {
         1: ("shelly", "Shelly"),
         2: ("shelly2", "Shelly north PV"),
-        3: ("ac_storage1", "AC storage 1"),
-        4: ("ac_storage2", "AC storage 2"),
+        3: ("ac_storage1", "Shelly at AC storage 1"),
+        4: ("ac_storage2", "Shelly at AC storage 2"),
     }
     key, name = slots[nr]
     return key, name, f"{BASE}/{key}"
@@ -2354,6 +2329,16 @@ def shelly_poll(nr):
             log.warning("%s %s unreachable (%dx): %s", name, ip, fails, exc)
         if fails == 5:
             event(f"{name} {ip} is not responding", also_log=False)
+        # Drop the reading once the unit has clearly gone. Keeping the last
+        # value on screen is worse than showing nothing: a plug that died
+        # hours ago went on displaying -15 W as if it were live.
+        if fails >= SHELLY_STALE_AFTER:
+            with st.lock:
+                setattr(st, f"{key}_power", None)
+                setattr(st, f"{key}_on", None)
+            mqttc.publish(topic, json.dumps({
+                "power": None, "state": None, "ip": ip,
+            }))
 
 
 def shelly_loop(nr):
@@ -2385,14 +2370,17 @@ def shelly_switch(on, nr=1):
 
 
 def offgrid_watch_loop():
-    """Reports for as long as the state of charge locks out the off-grid
-    output.
+    """Reports when the off-grid output is enabled but nothing comes out.
 
-    No datapoint reveals the socket's actual state - DP 135 reports about
-    235 V throughout, whether or not anything is present at the output. The
-    lockout is therefore the only statement that holds up: below the discharge
-    stop plus OFFGRID_SOC_MARGIN the device will not release the output, no
-    matter what DP 119 says.
+    DP 140 (off-grid current) is the one readout that tells the truth: it sits
+    at 0.2 to 0.3 A while the socket is live, even with nothing plugged in, and
+    drops to 0 when the output is off. DP 119 is only the permission.
+
+    The state-of-charge lockout is used to explain a dead output, never to
+    predict one. Measured on 13.09.: the device released the output at 19 %
+    with a discharge stop of 15, so the "+5" rule is a guide and not a law.
+    Reporting on the model alone produced a false alarm twelve seconds before
+    the current started flowing.
     """
     while True:
         time.sleep(20)
@@ -2400,16 +2388,34 @@ def offgrid_watch_loop():
             continue
         dps = st.snapshot()
         if not dps.get(DP_OFFGRID):
-            st.offgrid_reported = False
-            continue                      # not enabled, nothing to report
-        locked, soc, threshold = offgrid_locked(dps)
-        if locked and not st.offgrid_reported:
+            st.offgrid_since = 0.0
+            if st.offgrid_reported:
+                st.offgrid_reported = False
+            continue
+        current = dps.get("140")
+        if not isinstance(current, (int, float)):
+            continue
+        live = current > 0
+        if live:
+            st.offgrid_since = 0.0
+            if st.offgrid_reported:
+                st.offgrid_reported = False
+                event("Off-grid output is delivering again")
+            continue
+        if not st.offgrid_since:
+            st.offgrid_since = time.time()
+            continue
+        if (not st.offgrid_reported
+                and time.time() - st.offgrid_since > OFFGRID_MISMATCH_S):
             st.offgrid_reported = True
-            event(f"Off-grid output enabled but locked out: state of charge "
-                  f"{soc} %, the device releases it at {threshold} %")
-        elif not locked and st.offgrid_reported:
-            st.offgrid_reported = False
-            event(f"Off-grid output released again (state of charge {soc} %)")
+            locked, soc, threshold = offgrid_locked(dps)
+            if locked:
+                event(f"Off-grid output enabled but dead - state of charge "
+                      f"{soc} %, the device usually releases it around "
+                      f"{threshold} %")
+            else:
+                event("Off-grid output enabled but no current is flowing "
+                      "(DP 140 at 0)")
 
 
 def charge_guard_loop():
@@ -2543,6 +2549,61 @@ def probe_verdict(meter_now, draw_now, now=None):
     if share >= PROBE_ACCEPT:
         return "genuine", detail
     return "compensated", detail
+
+
+def negative_target_guard(setpoint, limit, actual, now=None):
+    """Keeps a negative meter target from feeding a neighbouring battery.
+
+    Mirror of the surplus probe. Raising export is a probe: afterwards the
+    balanced sum has to have moved down by a fair share of what we actually
+    put out. If it did not, something else absorbed it, and the export ceiling
+    stays where it was until the situation changes.
+
+    Lowering is always allowed and never waits.
+    """
+    now = now or time.time()
+    with st.lock:
+        smoothed = st.phase_sum
+
+    if st.neg_probe_at and now - st.neg_probe_at >= PROBE_SETTLE:
+        st.neg_probe_at = 0.0
+        usable = (st.neg_probe_sum is not None and st.neg_probe_out is not None
+                  and isinstance(smoothed, (int, float))
+                  and isinstance(actual, (int, float)))
+        if usable:
+            gave = actual - st.neg_probe_out        # >0: we export more
+            moved = st.neg_probe_sum - smoothed     # >0: meter went more negative
+            if gave >= PROBE_MIN_DRAW:
+                share = moved / gave
+                if share < PROBE_ACCEPT:
+                    # Fall back to what was set before the probe, not to the
+                    # raised value. The step that triggered the verdict went
+                    # into the neighbour, so keeping it would leave several
+                    # hundred watts running there permanently.
+                    st.neg_cap = float(st.neg_probe_limit
+                                       if st.neg_probe_limit is not None
+                                       else limit)
+                    event(f"Negative meter target capped at {int(st.neg_cap)} W - "
+                          f"exported {gave:+.0f} W more but the meter only "
+                          f"moved {moved:+.0f} W ({share * 100:.0f} %), so "
+                          f"something else is absorbing it")
+                elif st.neg_cap is not None:
+                    st.neg_cap = None
+                    event("Negative meter target released - the meter is "
+                          "following again")
+
+    if st.neg_cap is not None:
+        setpoint = min(setpoint, st.neg_cap)
+
+    if st.neg_probe_at:
+        # A probe is settling: hold, do not raise further.
+        return min(setpoint, float(limit))
+    if setpoint > limit + CTRL_MIN_STEP:
+        setpoint = min(setpoint, limit + NEG_PROBE_STEP)
+        st.neg_probe_sum, st.neg_probe_out = smoothed, actual
+        st.neg_probe_limit = float(limit)
+        st.neg_probe_at = now
+    return setpoint
 
 
 def surplus_decision(grid, soc, socmax, draw, now=None):
@@ -2892,20 +2953,7 @@ def control_loop():
             st.grid_fail = False
             event("Meter is reporting again - control active")
 
-        storage_power, storage_ready, storage_configured = \
-            ac_storage_charge_power()
-        meter_target = compensated_meter_target(
-            requested_target, storage_power, storage_ready,
-            storage_configured)
-        waiting = (requested_target < 0 and storage_configured
-                   and not storage_ready)
-        if waiting and not st.ac_storage_wait:
-            st.ac_storage_wait = True
-            event("Negative meter target paused - no fresh reading from an "
-                  "enabled AC-storage Shelly")
-        elif not waiting and st.ac_storage_wait:
-            st.ac_storage_wait = False
-            event("AC-storage Shelly readings available - negative target active")
+        meter_target = requested_target
 
         # ------------------------------------------------------------------
         # Pass-through
@@ -3130,14 +3178,17 @@ def control_loop():
                                       st.tune["gain"], max_step)
         st.setpoint = setpoint
 
+        if requested_target < 0:
+            setpoint = negative_target_guard(setpoint, limit, actual)
+        elif st.neg_cap is not None or st.neg_probe_at:
+            st.neg_cap, st.neg_probe_at, st.neg_probe_limit = None, 0.0, None
+
         new = int(round(setpoint))
         if abs(new - limit) < CTRL_MIN_STEP:
             continue
 
-        log.info("Meter %+.0f W (target %+.0f, requested %+d, AC storage %.0f W) "
-                 "| actual %.0f W | export %s -> %s",
-                 grid, target, requested_target, storage_power,
-                 actual, limit, new)
+        log.info("Meter %+.0f W (target %+.0f) | actual %.0f W | "
+                 "export %s -> %s", grid, target, actual, limit, new)
         set_limit(new, reason="control")
         publish_state()
 

@@ -22,9 +22,10 @@ Regulation holds the grid connection at ±4 W.
   deliberate grid import, or a negative value for deliberate export — for
   example to make another AC-coupled storage unit charge before the EP2500 is
   full
-- Two optional Shelly inputs for AC-coupled storage units. Their measured
-  charging power is folded into a negative meter target, preventing the
-  controller from ramping up again as the other storage absorbs the surplus
+- **Per-phase meter readings.** The Eco Tracker reports each phase separately.
+  Subtracting the device's own contribution shows what else sits on its phase,
+  which is what makes the checks below possible without any knowledge of the
+  neighbouring hardware
 - **Pass-through mode**: above a configurable state of charge the controller
   stops regulating against the meter. It pins the export limit at `LIMIT_MAX`
   and trims the PV charge power so the state of charge holds steady, keeping
@@ -39,10 +40,14 @@ Regulation holds the grid connection at ±4 W.
 - **Log recording from the dashboard**: a switch starts mirroring the bridge's
   log into a file, and the bridge serves the recordings over HTTP so you can
   download them without shell access
-- **Signed meter target with AC-storage compensation**: aim for a deliberate
-  export so a second, AC-coupled storage unit starts charging. Shelly plugs in
-  front of those units measure what they absorb, and that is deducted from the
-  request, so the two controllers cannot ramp each other up
+- **Signed meter target**, with a guard against feeding a neighbouring
+  battery: raising export is only kept if the meter actually follows it
+- **Backup charging**: one switch puts the device into `backup_power` and
+  charges the battery from the grid at a configurable rate, stopping by itself
+  at the charge stop
+- **AC surplus charging**: the device absorbs genuine surplus automatically.
+  It probes before committing, so it cannot be fooled by another storage unit
+  producing the surplus
 - Estimated remaining runtime
 - Controller parameters adjustable from the dashboard, no restart needed
 - Event log covering the last 48 hours
@@ -50,7 +55,10 @@ Regulation holds the grid connection at ±4 W.
 - Meter readings are filtered the same way whichever source they come from:
   absurd values dropped, large jumps held back until the next reading confirms
   them
-- Optional Shelly integration for independent cross-checks
+- Up to four optional Shelly plugs for monitoring and remote shutdown: they
+  measure power as an independent cross-check and can cut the EP2500 or a
+  neighbouring unit from mains from the dashboard. Nothing in the control loop
+  depends on them
 
 ## Documentation
 
