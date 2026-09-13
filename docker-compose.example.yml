@@ -73,6 +73,8 @@ services:
       SURPLUS_STEP: "200"
       # Same probe, mirrored, for a negative meter target.
       NEG_PROBE_STEP: "150"
+      # How long a cap holds before the situation is tested again.
+      NEG_RETRY: "900"
       SURPLUS_ENTER_W: "100"
       SURPLUS_ENTER_S: "120"
       SURPLUS_EXIT_S: "90"

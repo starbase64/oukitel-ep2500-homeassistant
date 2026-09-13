@@ -204,6 +204,11 @@ PROBE_MIN_DRAW = int(os.getenv("PROBE_MIN_DRAW", "60"))  # W; below this no verd
 #
 # The rule is the same as for surplus: raising is a probe, lowering is free.
 NEG_PROBE_STEP = int(os.getenv("NEG_PROBE_STEP", "150"))  # W per verified step
+# How long a cap holds before the situation is tested again. Without a retry
+# the cap never lifts on its own: it pins the setpoint to the current limit,
+# so nothing ever asks for more and no new probe is started. The neighbour may
+# have filled up or been unplugged hours ago.
+NEG_RETRY = int(os.getenv("NEG_RETRY", "900"))
 
 SURPLUS_ENTER_W = int(os.getenv("SURPLUS_ENTER_W", "100"))
 SURPLUS_ENTER_S = int(os.getenv("SURPLUS_ENTER_S", "120"))
@@ -755,6 +760,7 @@ class State:
         self.neg_probe_out = None   # DP 155 before the step
         self.neg_probe_limit = None  # export limit before the step
         self.neg_cap = None         # export ceiling a failed probe imposed
+        self.neg_cap_at = 0.0       # when that ceiling was imposed
         self.setpoint = 0.0            # internal setpoint: >0 export, <0 charge
         self.events = []           # event list for the dashboard
         self.last_status = None    # previous device status (for events)
@@ -1620,8 +1626,10 @@ def on_message(client, userdata, msg):
         if want and not st.backup_on:
             start_backup()
         elif not want and st.backup_on:
-            st.backup_on = False
+            # Same ordering as the automatic stop: stop_charging reads the
+            # flag to decide whether anything was running.
             stop_charging("backup switched off")
+            st.backup_on = False
         client.publish(f"{BASE}/backup/state", "ON" if st.backup_on else "OFF",
                        retain=True)
         publish_state()
@@ -1763,6 +1771,7 @@ def on_message(client, userdata, msg):
             st.restored.add("correction")
             client.publish(f"{BASE}/correction/state", st.correction, retain=True)
             st.neg_cap, st.neg_probe_at, st.neg_probe_limit = None, 0.0, None
+            st.neg_cap_at = 0.0
             log.info("Meter target = %s W", st.correction)
             event(f"Meter target set to {st.correction:+d} W")
 
@@ -2433,6 +2442,12 @@ def charge_guard_loop():
         time.sleep(30)
         if not st.online:
             continue
+        # Backup and surplus charging set DP 122 deliberately. Correcting it
+        # back every 30 s would fight them - and on a 2500 W charge limit that
+        # means silently drawing 2500 W from the grid instead of the 800 W
+        # that was asked for.
+        if st.backup_on or st.surplus_active:
+            continue
         setpoint = st.tune["charge_limit"]
         actual = st.snapshot().get(DP_CHARGE)
         if isinstance(actual, int) and actual != setpoint:
@@ -2583,6 +2598,7 @@ def negative_target_guard(setpoint, limit, actual, now=None):
                     st.neg_cap = float(st.neg_probe_limit
                                        if st.neg_probe_limit is not None
                                        else limit)
+                    st.neg_cap_at = now
                     event(f"Negative meter target capped at {int(st.neg_cap)} W - "
                           f"exported {gave:+.0f} W more but the meter only "
                           f"moved {moved:+.0f} W ({share * 100:.0f} %), so "
@@ -2593,7 +2609,12 @@ def negative_target_guard(setpoint, limit, actual, now=None):
                           "following again")
 
     if st.neg_cap is not None:
-        setpoint = min(setpoint, st.neg_cap)
+        if now - st.neg_cap_at >= NEG_RETRY:
+            st.neg_cap = None
+            event("Negative meter target: testing again whether the export "
+                  "now reaches the meter")
+        else:
+            setpoint = min(setpoint, st.neg_cap)
 
     if st.neg_probe_at:
         # A probe is settling: hold, do not raise further.
@@ -2604,6 +2625,21 @@ def negative_target_guard(setpoint, limit, actual, now=None):
         st.neg_probe_limit = float(limit)
         st.neg_probe_at = now
     return setpoint
+
+
+def phase_sum_fresh(now=None):
+    """The smoothed sum, or None when the meter has gone quiet.
+
+    Without this the value simply freezes at its last reading and the surplus
+    logic keeps acting on it - it would go on raising the charge limit while
+    the meter has not said anything for hours.
+    """
+    now = now or time.time()
+    with st.lock:
+        value, age = st.phase_sum, now - st.phase_ts
+    if value is None or age > GRID_MAX_AGE:
+        return None
+    return value
 
 
 def surplus_decision(grid, soc, socmax, draw, now=None):
@@ -2625,8 +2661,13 @@ def surplus_decision(grid, soc, socmax, draw, now=None):
         st.probe_at = 0.0
         return "leave", 0, why
 
-    if isinstance(soc, (int, float)) and isinstance(socmax, (int, float)):
-        if soc >= socmax:
+    # Pass-through outranks surplus charging, so hand over at its threshold
+    # rather than at the charge stop. Charging on past it would walk the
+    # battery into the 100 % shutdown that pass-through exists to prevent.
+    if isinstance(soc, (int, float)):
+        if st.pass_on and soc >= st.tune["soc_pass"]:
+            return leave("pass-through takes over")
+        if isinstance(socmax, (int, float)) and soc >= socmax:
             return leave("battery full")
     if grid is None:
         return leave("no meter reading")
@@ -2691,15 +2732,28 @@ def surplus_decision(grid, soc, socmax, draw, now=None):
 
 
 def start_backup():
-    """Charges the battery from the grid until it is full. Manual only."""
-    st.backup_on = True
+    """Charges the battery from the grid until it is full. Manual only.
+
+    Returns True only once both writes actually landed. Reporting success on
+    a failed write would leave the switch showing "on" while the device does
+    nothing - and worse, the controller would stay paused for a mode that was
+    never entered.
+    """
     st.surplus_active = False
     stop_passthrough("backup charging", safe_limit=LIMIT_SAFE)
     if st.charge_before is None:
         st.charge_before = st.dps.get(DP_CHARGE, st.tune["charge_limit"])
-    set_charge(st.backup_power, reason="backup charge")
-    set_mode(MODE_BACKUP, reason="backup charge")
+    ok_charge = set_charge(st.backup_power, reason="backup charge")
+    ok_mode = set_mode(MODE_BACKUP, reason="backup charge")
+    if not (ok_charge and ok_mode):
+        st.backup_on = False
+        event("Backup charging could not be started - the device rejected "
+              "the charge limit or the mode change")
+        stop_charging("backup start failed")
+        return False
+    st.backup_on = True
     event(f"Backup charging started at {st.backup_power} W - control paused")
+    return True
 
 
 def stop_charging(reason):
@@ -2876,8 +2930,11 @@ def control_loop():
             if (isinstance(soc_now, (int, float))
                     and isinstance(soc_max, (int, float))
                     and soc_now >= soc_max):
-                st.backup_on = False
+                # stop_charging decides from backup_on/surplus_active whether
+                # anything was running, so clear the flag after the call and
+                # not before - otherwise the closing event never appears.
                 stop_charging(f"battery full at {soc_now} %")
+                st.backup_on = False
                 mqttc.publish(f"{BASE}/backup/state", "OFF", retain=True)
             continue
 
@@ -2892,8 +2949,7 @@ def control_loop():
                 mqttc.publish(f"{BASE}/surplus/state", "OFF", retain=True)
 
         if st.surplus_on and not st.pass_active:
-            with st.lock:
-                smoothed = st.phase_sum
+            smoothed = phase_sum_fresh()
             action, watt, why = surplus_decision(
                 smoothed, dps.get("102"), dps.get(DP_SOC_MAX), dps.get("137"))
             if action in ("enter", "probe", "lower", "hold"):
@@ -3176,12 +3232,17 @@ def control_loop():
         max_step = st.tune["max_step"]
         setpoint = calculate_setpoint(grid, target, actual, st.setpoint,
                                       st.tune["gain"], max_step)
-        st.setpoint = setpoint
 
         if requested_target < 0:
             setpoint = negative_target_guard(setpoint, limit, actual)
         elif st.neg_cap is not None or st.neg_probe_at:
             st.neg_cap, st.neg_probe_at, st.neg_probe_limit = None, 0.0, None
+            st.neg_cap_at = 0.0
+
+        # Store what the controller is really going to use. Saving the value
+        # from before the guard would both mislead the dashboard and give the
+        # next cycle the wrong starting point.
+        st.setpoint = setpoint
 
         new = int(round(setpoint))
         if abs(new - limit) < CTRL_MIN_STEP:
@@ -3217,6 +3278,12 @@ def main():
     threading.Thread(target=offgrid_watch_loop, daemon=True).start()
     for nr in (1, 2, 3, 4):
         threading.Thread(target=shelly_loop, args=(nr,), daemon=True).start()
+    if GRID_SOURCE == "mqtt":
+        log.warning("GRID_SOURCE=mqtt supplies the balanced total only. The "
+                    "per-phase readings come from the Eco Tracker's HTTP "
+                    "endpoint, so AC surplus charging and the phase display "
+                    "stay inactive. Set GRID_SOURCE=http and ECO_URL to use "
+                    "them.")
     if not REC_HOST:
         log.warning("REC_HOST is not set - recordings still work, but the "
                     "dashboard cannot offer a download link. Set it to the "
