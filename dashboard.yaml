@@ -255,6 +255,8 @@ views:
                 name: Deadband
               - entity: number.oukitel_ep2500_max_step
                 name: Max step
+              - entity: number.oukitel_ep2500_export_limit_max
+                name: Export limit max
               - entity: number.oukitel_ep2500_pass_through_from_soc
                 name: Pass-through from SoC
               - entity: number.oukitel_ep2500_pv_limit_when_open

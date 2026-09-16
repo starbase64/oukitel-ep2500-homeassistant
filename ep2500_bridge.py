@@ -123,7 +123,12 @@ DP_SOC_MIN = "124"         # discharge-stop SoC in %
 DP_PV_LIMIT = "156"        # PV charge limit, writable
 
 LIMIT_MIN = 0
-LIMIT_MAX = int(os.getenv("LIMIT_MAX", "800"))   # legal ceiling
+# Export ceiling. 800 W is the German limit for a balcony system, which is why
+# it is the default. It is adjustable from the dashboard up to LIMIT_HW_MAX
+# because the permitted figure differs by country and by installation - what
+# is allowed where you are is your responsibility, not the bridge's.
+LIMIT_MAX = int(os.getenv("LIMIT_MAX", "800"))
+LIMIT_HW_MAX = int(os.getenv("LIMIT_HW_MAX", "1500"))
 LIMIT_SAFE = int(os.getenv("LIMIT_SAFE", "0"))   # fallback on shutdown
 # Export limit to fall back to when the meter has been silent for longer
 # than GRID_MAX_AGE. 0 stops export entirely; a positive value keeps feeding
@@ -277,6 +282,7 @@ TUNABLES = {
     "gain":     ("Controller gain", 0.1, 2.0, 0.1, None, float),
     "deadband": ("Deadband",          0,   200, 5,   "W", int),
     "max_step": ("Max step", 10,  800, 10,  "W", int),
+    "limit_max": ("Export limit max", 0, LIMIT_HW_MAX, 50, "W", int),
     "charge_limit": ("Charge limit guard", 0, CHARGE_HW_MAX, 100, "W", int),
     "soc_pass":  ("Pass-through from SoC", 50, 100, 1, "%", int),
     "pv_max":    ("PV limit when open", 500, 4000, 100, "W", int),
@@ -287,6 +293,7 @@ TUNE_DEFAULTS = {
     "gain": 1.0,
     "deadband": 15,
     "max_step": 800,
+    "limit_max": LIMIT_MAX,
     "charge_limit": 2500,
     "soc_pass": 95,
     "pv_max": 4000,
@@ -324,7 +331,7 @@ PASS_SETTLE = 120          # s of quiet after start before trimming
 # log consists of nothing but those transitions.
 IDLE_HOLD = 180            # s
 PASS_BATT_BIAS = 50        # W per point of deviation, target for the gate
-PASS_PV_CAP = 2 * LIMIT_MAX  # W; pass-through never needs more
+PASS_PV_CAP = 2 * LIMIT_HW_MAX  # W; pass-through never needs more
 
 # The device reports some values as unsigned 16-bit numbers. 65535 is then not
 # a power reading but -1. Above this threshold the value is converted back;
@@ -919,7 +926,7 @@ def publish_discovery(client):
         "state_topic": f"{BASE}/state",
         "value_template": "{{ value_json.limit }}",
         "command_topic": f"{BASE}/limit/set",
-        "min": LIMIT_MIN, "max": LIMIT_MAX, "step": 5,
+        "min": LIMIT_MIN, "max": LIMIT_HW_MAX, "step": 5,
         "unit_of_measurement": "W",
         "mode": "box",
         "availability_topic": f"{BASE}/available",
@@ -1916,12 +1923,14 @@ def clamp_meter_target(value):
                min(METER_TARGET_MAX, int(round(float(value)))))
 
 
-def calculate_setpoint(grid, target, actual, current, gain, max_step):
+def calculate_setpoint(grid, target, actual, current, gain, max_step,
+                       ceiling=None):
     """Returns the next DP 121 setpoint for a signed meter target."""
     error = grid - target  # >0: output must rise; <0: output must fall
+    ceiling = float(LIMIT_MAX if ceiling is None else ceiling)
     current = min(actual + WINDUP_MARGIN, current)
     current += max(-max_step, min(max_step, error * gain))
-    return max(0.0, min(float(LIMIT_MAX), current))
+    return max(0.0, min(float(ceiling), current))
 
 
 mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ep2500-bridge")
@@ -2032,7 +2041,7 @@ def write_dp(dp, watt, vmax, reason=""):
 
 
 def set_limit(watt, reason=""):
-    return write_dp(DP_LIMIT, watt, LIMIT_MAX, reason)
+    return write_dp(DP_LIMIT, watt, st.tune["limit_max"], reason)
 
 
 def set_charge(watt, reason=""):
@@ -3212,7 +3221,7 @@ def control_loop():
         # Pass-through
         # ------------------------------------------------------------------
         # Goal: the state of charge stays put and the device exports a
-        # constant LIMIT_MAX into the house. Because PV always runs through
+        # constant export limit into the house. Because PV always runs through
         # the battery on the EP2500, that simply means setting the PV charge
         # power so it covers the export. Two fixed values, no balance loop.
         #
@@ -3223,6 +3232,7 @@ def control_loop():
         # than the rule - hence one small step every few minutes is enough.
         soc = dps.get("102")
         target = st.tune["soc_pass"]
+        cap = st.tune["limit_max"]   # the ceiling in force right now
         if st.pass_on and isinstance(soc, (int, float)):
             # Hysteresis: once active it stays until PASS_HYST below target
             threshold = target - PASS_HYST if st.pass_active else target
@@ -3232,7 +3242,7 @@ def control_loop():
             else:
                 # A negative or positive meter target normally wins: the user
                 # asked for a specific figure at the meter, and pass-through
-                # would override it with a fixed LIMIT_MAX.
+                # would override it with the fixed export ceiling.
                 #
                 # That deference ends near the charge stop. Letting the device
                 # run into its 100 % shutdown costs far more than missing a
@@ -3266,14 +3276,14 @@ def control_loop():
                 st.pass_active = True
                 st.pass_next = time.time() + PASS_SETTLE
                 event(f"Pass-through active - holding state of charge at {target} %, "
-                      f"{LIMIT_MAX} W into the house")
-                set_limit(LIMIT_MAX, reason="pass-through")
-                st.setpoint = float(LIMIT_MAX)
+                      f"{cap} W into the house")
+                set_limit(cap, reason="pass-through")
+                st.setpoint = float(cap)
                 # Same rule here: only advance the marker on a successful
                 # write. If the command is rejected, the controller would
                 # otherwise start out holding a value the device never got.
-                if set_pv_limit(LIMIT_MAX, reason="pass-through"):
-                    st.pass_pv_setpoint = LIMIT_MAX
+                if set_pv_limit(cap, reason="pass-through"):
+                    st.pass_pv_setpoint = cap
                     st.pass_pv_pending = False
                 else:
                     st.pass_pv_pending = True
@@ -3297,9 +3307,9 @@ def control_loop():
             # SoC is exactly on target; otherwise the old code could remain in
             # pass-through forever with no effective PV setting.
             if st.pass_pv_pending:
-                if set_pv_limit(LIMIT_MAX,
+                if set_pv_limit(cap,
                                 reason="pass-through: initial retry"):
-                    st.pass_pv_setpoint = LIMIT_MAX
+                    st.pass_pv_setpoint = cap
                     st.pass_pv_pending = False
                     st.pass_next = time.time() + PASS_SETTLE
                     publish_state()
@@ -3309,11 +3319,11 @@ def control_loop():
 
             # The export limit is fixed. If something else moved it (the app,
             # a rejected command), put it back.
-            if isinstance(limit, int) and limit != LIMIT_MAX:
+            if isinstance(limit, int) and limit != cap:
                 log.info("Pass-through | export limit is %s W instead of %s W - "
-                         "corrected", limit, LIMIT_MAX)
-                set_limit(LIMIT_MAX, reason="pass-through: hold limit")
-                st.setpoint = float(LIMIT_MAX)
+                         "corrected", limit, cap)
+                set_limit(cap, reason="pass-through: hold limit")
+                st.setpoint = float(cap)
                 publish_state()
 
             if time.time() < st.pass_next:
@@ -3459,7 +3469,8 @@ def control_loop():
 
         max_step = st.tune["max_step"]
         setpoint = calculate_setpoint(control_value, target, actual,
-                                      st.setpoint, st.tune["gain"], max_step)
+                                      st.setpoint, st.tune["gain"], max_step,
+                                      ceiling=st.tune["limit_max"])
 
         if requested_target < 0:
             setpoint = negative_target_guard(setpoint, limit, actual,
