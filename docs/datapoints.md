@@ -18,7 +18,7 @@ menu.*
 | DP | Meaning | Unit | App label | Confidence |
 |---|---|---|---|---|
 | 118 | Backflow prevention – blocks **export** | bool | Anti-backflow | certain |
-| 119 | Off-grid socket on/off | bool | – | certain |
+| 119 | Off-grid outlet on/off | bool | – | certain |
 | 120 | Anti-backflow grid regulation | W | same | meaning unclear |
 | 121 | Max. feed-in power | W | Maximum allowable feed-in power | certain |
 | 122 | Max. battery charge power **total** (PV + grid) | W | Maximum allowable battery charging power | certain |
@@ -42,7 +42,7 @@ There may be more that were not triggered during testing.
 active. It is the PV charge power actually in effect. No separate datapoint was
 found for PV charge power 1 – possibly identical with 156.
 
-**Note on DP 119 – off-grid socket:** this is the permission, not the state.
+**Note on DP 119 – off-grid outlet:** this is the permission, not the state.
 The device normally releases the output once the state of charge is about five
 points above the discharge stop (DP 124); below that it acknowledges a write
 and leaves the socket dead. Treat that as a guide, not a law: on 13.09. the
@@ -94,15 +94,16 @@ device goes to standby and stops feeding, but keeps draining the battery. Two
 nights measured at 14–15 % state of charge, with `BATT_WH` of 2048 one point
 equals 20.5 Wh:
 
-| Night | Off-grid socket | Minutes per point | Self-consumption |
+| Night | Off-grid outlet | Minutes per point | Self-consumption |
 |---|---|---|---|
 | 09./10.09. | on | 79–80 (six transitions) | ~15.6 W |
 | 11./12.09. | off | 285 (one transition) | ~4.3 W |
 | 12./13.09. | off | over 328, no transition | under 3.8 W |
+| 13./14.09. | on, from 19:46 off | 87-103 over five transitions | ~13 W |
 
 So the energised socket costs roughly 12 W, about 70 % of the idle draw.
 `homeassistant/offgrid_night.yaml` switches it off between sunset and sunrise;
-details in [setup.md](setup.md), section "The off-grid socket".
+details in [setup.md](setup.md), section "The off-grid outlet".
 
 Two caveats on those figures. The 4.3 W rest on a single percentage point
 against six for the 15.6 W, so treat the exact value as provisional. And both
@@ -154,7 +155,7 @@ even with an empty battery and full sun. See the section on quirks below.
 | 139 | Grid voltage | ÷10 → V | certain |
 | 149 | System fault register, latched (see note) | – | certain |
 | 136 | Grid current | ÷10 → 0.8 A | certain |
-| 141 / 142 | Off-grid socket load, both registers identical | W | certain |
+| 141 / 142 | Off-grid outlet load, both registers identical | W | certain |
 | 140 | Off-grid output current, 0 when the socket is off | ÷10 → 8.7 A | certain |
 | 143 | Total PV power | W | certain |
 | 155 | AC output power (**excluding** off-grid load) | W | certain |
@@ -247,9 +248,9 @@ has no effect on charging from the grid.
 I have not found a reliable way to block grid charging while allowing PV
 charging.
 
-### 3. The off-grid socket runs on a separate path
+### 3. The off-grid outlet runs on a separate path
 
-The load on the off-grid socket (DP 141/142) is **not** included in the AC
+The load on the off-grid outlet (DP 141/142) is **not** included in the AC
 output power (DP 155) and does not appear at the grid meter. It is therefore
 invisible to any zero-export controller.
 

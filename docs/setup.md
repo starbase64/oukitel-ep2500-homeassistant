@@ -462,7 +462,91 @@ Negative meter target capped at 285 W - exported +132 W more but the meter
 only moved +1 W (1 %), so something else is absorbing it
 ```
 
-Changing the target releases the cap.
+Changing the target releases the cap. So does the dip test below.
+
+### Which reading the target follows
+
+A non-zero target can be regulated against either reading. Three settings,
+selectable from the dashboard.
+
+**Balanced sum** (default) is what the meter bills. A storage unit on any
+phase can absorb the export, so the target may simply be unreachable - the
+probe and the cap above exist for exactly that.
+
+**Own phase** regulates the phase the EP2500 is wired to. A unit on a
+different phase cannot influence that reading at all, so the loop is not
+detected, it is impossible. Ask for -800 W and the device exports whatever it
+takes to make its own phase read -800 W, even 1000 W if 200 W of house load
+sits on that phase.
+
+**Automatic** (default) is the balanced sum until the state of charge reaches
+the pass-through threshold, and the own phase from there on. That is where the
+distinction actually matters.
+
+Below the threshold the battery is still being filled, so export may well be
+coming out of it - the balanced sum is the honest reading and the probe has
+something to catch. At and above it the battery is held, the exported energy
+is PV, and local loads on the device's own phase are quietly eating into what
+was meant to reach the other storage unit. Compensating for them is exactly
+what is wanted, even if it means putting out 1000 W to leave 800 W on the
+phase.
+
+Note that "full" here means the pass-through threshold, not the charge stop.
+The device must never actually reach 100 %, so that is the only sensible
+reading of full.
+
+The switch is logged both ways:
+
+```
+Meter target now follows phase L1 - battery at 90 %, local loads on that
+phase are compensated
+```
+
+**The trade-off is the bill.** In own-phase mode the balanced total is no
+longer the reference. If the other phases import while this one exports, the
+meter can sit in import while the dashboard shows the target met. With a
+balanced meter that means buying electricity to charge the storage unit. Use
+it when there is genuine surplus, not as a permanent setting.
+
+Two details. A target of exactly 0 always uses the balanced sum - zero export
+is a statement about the meter, not about one phase. And if the phase reading
+goes stale, the controller falls back to the sum and says so, rather than
+regulating against a value that stopped moving.
+
+The probe and the dip always measure whatever the controller is steering. In
+own-phase mode they judge the phase, so they still catch a neighbouring unit
+that happens to sit on the *same* phase - the one case where the loop can
+still occur.
+
+### Telling a storage unit from a real load
+
+A cap should not last forever - the neighbour may have filled up or been
+unplugged, and a real load may have appeared that genuinely wants the power.
+Testing that by pushing export back up is expensive: every watt of the test
+goes into the neighbour's battery if the suspicion was right.
+
+Lowering export answers the same question for free. Every `NEG_RETRY` seconds
+the controller withholds `NEG_DIP` watts for one settling period and watches
+who follows:
+
+| | What the meter does | Conclusion |
+|---|---|---|
+| Real load | moves towards import by the full amount withheld | not a storage unit, cap released |
+| Storage unit | barely moves, it simply charges less | still tracking us, cap held |
+
+```
+Negative meter target released - held back 150 W and the meter followed by
+150 W (100 %), so this is a real load and not a storage unit
+```
+
+This also covers the case where both are present: you ask for -200 W, a
+storage unit takes it, and then a real consumer switches on as well. The dip
+separates the two, and export is allowed to rise again for the part that is
+genuinely being used.
+
+Moving back up to a level already reached is not treated as a probe. Without
+that exception the return from each dip would be measured as an increase,
+fail its own check, and ratchet the ceiling down step by step.
 
 Be clear about what this does and does not achieve. It stops the escalation.
 It cannot make the neighbour take exactly the amount you asked for - that unit
@@ -553,7 +637,7 @@ cutting a unit from mains remotely when something goes wrong.
 | Slot | Typical use |
 |---|---|
 | `SHELLY_IP` | in front of the EP2500 - independent check on DP 155, and a hard mains disconnect |
-| `SHELLY2_IP` | a second PV system or another device worth watching |
+| `SHELLY2_IP` | anything else worth watching. Set `SHELLY2_ON_OFFGRID` when it hangs on the off-grid outlet itself - it is then not polled while the outlet is dead, instead of logging a failure every few seconds |
 | `AC_STORAGE1_IP`, `AC_STORAGE2_IP` | AC-coupled storage units - remote emergency shutdown |
 
 The addresses are editable from the dashboard and stored as retained MQTT, so
@@ -564,7 +648,7 @@ loses its connection while it is off - that is the point of it.
 
 ---
 
-# The off-grid socket
+# The off-grid outlet
 
 Important if you plug anything in there: **the off-grid load does not appear in
 the AC output power (DP 155) and not at the meter.** It runs on a separate path
@@ -585,9 +669,19 @@ not tested. On the type plate the off-grid terminal is listed as output only.
 
 ## The switch shows the permission, not the state
 
-The dashboard therefore carries two entries. **Off-grid socket (permission)**
+The dashboard therefore carries two entries. **Off-grid outlet (permission)**
 is DP 119, what you asked for. **Off-grid output live** is derived from DP 140
 and says whether current is actually flowing.
+
+Switching the outlet on while the battery is too empty is the common case: the
+sunrise automation fires, the device accepts the command and does nothing,
+and the outlet stays dead until the battery reaches its release threshold -
+which on a dull morning can be most of the day. Observed on 16.09.: enabled at
+sunrise at 13 % state of charge, still dead hours later.
+
+That is reported after `OFFGRID_MISMATCH_S` and repeated every
+`OFFGRID_REMIND_S` while it lasts, with the elapsed time in the message. A
+single line at dawn is too easy to miss.
 
 They come apart in practice. Measured on 13.09.: DP 140 dropped to 0 while
 DP 119 stayed on and was never written - the device withdrew the output on its
@@ -630,9 +724,9 @@ state.
 
 Once the device reaches the discharge-stop SoC it goes to standby and stops
 feeding, but it keeps draining the battery. Two nights measured at 14–15 %
-state of charge, one with the off-grid socket energised and one without:
+state of charge, one with the off-grid outlet energised and one without:
 
-| Night | Off-grid socket | Minutes per point | Self-consumption |
+| Night | Off-grid outlet | Minutes per point | Self-consumption |
 |---|---|---|---|
 | 09./10.09. | on | 79–80 (six transitions) | ~15.6 W |
 | 11./12.09. | off | 285 (one transition) | ~4.3 W |
@@ -686,7 +780,7 @@ and the entity ID will match.
 
 ```yaml
 - id: ep2500_offgrid_sunset
-  alias: EP2500 - off-grid socket off at sunset
+  alias: EP2500 - off-grid outlet off at sunset
   mode: single
   triggers:
     - trigger: sun
@@ -702,10 +796,10 @@ and the entity ID will match.
     - action: logbook.log
       data:
         name: EP2500
-        message: Off-grid socket switched off at sunset.
+        message: Off-grid outlet switched off at sunset.
 
 - id: ep2500_offgrid_sunrise
-  alias: EP2500 - off-grid socket on at sunrise
+  alias: EP2500 - off-grid outlet on at sunrise
   mode: single
   triggers:
     - trigger: sun
@@ -721,10 +815,10 @@ and the entity ID will match.
     - action: logbook.log
       data:
         name: EP2500
-        message: Off-grid socket switched on at sunrise.
+        message: Off-grid outlet switched on at sunrise.
 
 - id: ep2500_offgrid_apply_now
-  alias: EP2500 - align off-grid socket when the helper changes
+  alias: EP2500 - align off-grid outlet when the helper changes
   mode: single
   triggers:
     - trigger: state
@@ -742,7 +836,7 @@ and the entity ID will match.
         entity_id: switch.oukitel_ep2500_off_grid_socket
 
 - id: ep2500_offgrid_helper_off
-  alias: EP2500 - restore off-grid socket when night switch is disabled
+  alias: EP2500 - restore off-grid outlet when night switch is disabled
   mode: single
   triggers:
     - trigger: state
