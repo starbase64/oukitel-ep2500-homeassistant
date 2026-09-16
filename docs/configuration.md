@@ -37,7 +37,8 @@ anything has been stored.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LIMIT_MAX` | `800` | W; hard ceiling on export. The legal feed-in limit |
+| `LIMIT_MAX` | `800` | W; export ceiling at startup. Also editable from the dashboard, where it is stored as retained MQTT |
+| `LIMIT_HW_MAX` | `1500` | W; highest value that dashboard field accepts |
 | `LIMIT_SAFE` | `0` | W; export limit on shutdown |
 | `CHARGE_HW_MAX` | `4000` | W; ceiling on the charge limit (DP 122) |
 | `BATT_WH` | `2048` | usable capacity, for the runtime estimate |

@@ -407,6 +407,23 @@ In the dashboard under Control:
 - **Backflow prevention:** off, unless you want to block export entirely.
 - **Control active:** on.
 
+## The export ceiling
+
+`LIMIT_MAX` sets it at startup and the dashboard field **Export limit max**
+changes it at runtime, up to `LIMIT_HW_MAX`. Everything respects it: the
+zero-export controller, a meter target and pass-through, which pins the limit
+to exactly this value.
+
+The default of 800 W is the German limit for a balcony system. Other countries
+and other installations allow different figures, which is why the field exists
+- but what is permitted at your connection is your responsibility, not the
+bridge's. The bridge will put out whatever you enter.
+
+One thing it cannot do: exceed the ceiling to compensate for loads on its own
+phase. If 200 W is consumed on that phase and the ceiling is 800 W, the export
+reaching the meter is 600 W. Raising the ceiling is the only way to change
+that, with the caveat above.
+
 ## 7.2 Settings that worked for me
 
 | Parameter | Value | Why |
