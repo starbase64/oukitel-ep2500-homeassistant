@@ -1,3 +1,4 @@
+# Every setting and its default: docs/configuration.md
 # Copy to docker-compose.yml and fill in your values.
 # docker-compose.yml is gitignored so your credentials stay local.
 
@@ -51,6 +52,10 @@ services:
       AC_STORAGE1_IP: ""
       AC_STORAGE2_IP: ""
       SHELLY_STALE_AFTER: "5"
+      # Set to "true" when SHELLY2 hangs on the off-grid outlet: it is then
+      # not polled while the outlet is dead, instead of logging a failure
+      # every few seconds.
+      SHELLY2_ON_OFFGRID: "false"
       SHELLY2_IP:   ""
       # Shelly plugs measuring the input of up to two AC-coupled stores.
       # These can also be entered later in Home Assistant.
@@ -61,6 +66,11 @@ services:
       # Which phase the EP2500 is wired to. Also selectable from the
       # dashboard; this is only the fallback before anything is stored.
       EP_PHASE:     "1"
+      # What a non-zero meter target is regulated against: "auto" (balanced
+      # sum until the battery reaches the pass-through threshold, own phase
+      # from there on), "sum" or "own_phase". Also selectable from the
+      # dashboard. See "Which reading the target follows" in docs/setup.md.
+      METER_TARGET_REF: "auto"
       PHASE_SMOOTH: "0.25"
       # Seconds between phase lines in the log. 0 turns them off.
       PHASE_LOG_INTERVAL: "60"
@@ -74,7 +84,11 @@ services:
       # Same probe, mirrored, for a negative meter target.
       NEG_PROBE_STEP: "150"
       # How long a cap holds before the situation is tested again.
-      NEG_RETRY: "900"
+      NEG_RETRY: "600"
+      # Watts withheld during the dip test.
+      NEG_DIP: "150"
+      # Default power for backup charging, also editable from the dashboard.
+      BACKUP_POWER: "800"
       SURPLUS_ENTER_W: "100"
       SURPLUS_ENTER_S: "120"
       SURPLUS_EXIT_S: "90"
@@ -89,6 +103,10 @@ services:
       # Margin above the discharge stop at which the device releases the
       # off-grid output again. 5 on the unit this was written for.
       OFFGRID_SOC_MARGIN: "5"
+      OFFGRID_MISMATCH_S: "60"
+      # How often a dead output is mentioned again. 0 = once only.
+      OFFGRID_REMIND_S: "14400"
+      WORKER_RESTART_S: "15"
       SHELLY_INTERVAL: "5"
 
       # --- logging ----------------------------------------------------

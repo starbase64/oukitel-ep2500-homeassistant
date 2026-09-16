@@ -33,9 +33,9 @@ Regulation holds the grid connection at ±4 W.
 - **System fault sensor**: DP 149 is decoded and surfaced in Home Assistant.
   The register latches — it survives until the device is restarted, so without
   a sensor a fault sits there unnoticed for days
-- Optional Home Assistant automation that switches the off-grid socket off
+- Optional Home Assistant automation that switches the off-grid outlet off
   overnight. The device keeps the socket energised at idle, and standby draw
-  measured at about 11 W for the socket alone — see "The off-grid socket" in
+  measured at about 11 W for the socket alone — see "The off-grid outlet" in
   [docs/setup.md](docs/setup.md), YAML in `homeassistant/offgrid_night.yaml`
 - **Log recording from the dashboard**: a switch starts mirroring the bridge's
   log into a file, and the bridge serves the recordings over HTTP so you can
@@ -64,6 +64,8 @@ Regulation holds the grid connection at ±4 W.
 
 - [Datapoint reference](docs/datapoints.md) – all 83 DPs, what is known and
   what is not
+- [Configuration reference](docs/configuration.md) – every environment
+  variable, grouped, with its default
 - [Setup guide](docs/setup.md) – from Tuya developer account to running
   controller
 

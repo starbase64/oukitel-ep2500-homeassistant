@@ -76,6 +76,10 @@ SHELLY_STALE_AFTER = int(os.getenv("SHELLY_STALE_AFTER", "5"))
 # Second Shelly, for example on a north-facing balcony PV system. Leave empty
 # if you do not have one.
 SHELLY2_IP = os.getenv("SHELLY2_IP", "")
+# Set when that plug hangs on the off-grid outlet itself. It then loses power
+# whenever the outlet does, and polling it would produce a stream of failures
+# that says nothing - and drowns out the real ones.
+SHELLY2_ON_OFFGRID = os.getenv("SHELLY2_ON_OFFGRID", "false").lower() == "true"
 
 # Shelly plugs in front of AC-coupled storage units. These are switches only -
 # a way to cut those units from mains remotely. Their readings deliberately do
@@ -172,6 +176,34 @@ PHASE_FIELDS = ("powerPhase1", "powerPhase2", "powerPhase3")
 # numbers are missing. 0 turns it off.
 PHASE_LOG_INTERVAL = int(os.getenv("PHASE_LOG_INTERVAL", "60"))
 
+# Which reading a non-zero meter target is regulated against.
+#
+#   "sum"        the balanced total, as the meter bills it. A neighbouring
+#                storage unit on any phase can absorb the export, so the
+#                target may be unreachable - that is what the probe and the
+#                cap are for.
+#   "own_phase"  the phase the EP2500 is wired to. A unit on a different
+#                phase cannot influence that reading at all, so the target is
+#                reachable and stable. The price is that it no longer says
+#                anything about the bill: the balanced total may sit in import
+#                while the device's own phase reads the requested export.
+#   "auto"       the balanced sum until the battery reaches the pass-through
+#                threshold, the own phase from there on.
+#
+# "auto" is the useful one. Below the threshold the battery is still being
+# filled, so export may well be coming out of it - the balanced sum is then
+# the honest reading and the probe has something to catch. At and above it the
+# battery is held, the exported energy is PV, and local loads on the device's
+# own phase are quietly eating into what was meant to reach the other storage
+# unit. Compensating for them is exactly what is wanted there, even if it
+# means putting out 1000 W to leave 800 W on the phase.
+#
+# A target of exactly 0 always uses the balanced sum - zero export is a
+# statement about the meter, not about one phase.
+METER_TARGET_REF = os.getenv("METER_TARGET_REF", "auto")
+TARGET_REF_LABEL = {"auto": "Automatic", "sum": "Balanced sum",
+                    "own_phase": "Own phase"}
+
 # Telling real surplus from surplus a neighbouring battery is producing cannot
 # be done from meter readings alone - a phase reading negative looks the same
 # either way. What does work is checking whether the meter follows our own
@@ -208,7 +240,20 @@ NEG_PROBE_STEP = int(os.getenv("NEG_PROBE_STEP", "150"))  # W per verified step
 # the cap never lifts on its own: it pins the setpoint to the current limit,
 # so nothing ever asks for more and no new probe is started. The neighbour may
 # have filled up or been unplugged hours ago.
-NEG_RETRY = int(os.getenv("NEG_RETRY", "900"))
+NEG_RETRY = int(os.getenv("NEG_RETRY", "600"))
+# The retry is a dip, not a push. Lowering export and watching who follows
+# separates the two cases as well as raising it does, and costs nothing:
+#
+#   a real load keeps drawing, so the meter moves towards import by the full
+#   amount we stopped exporting
+#   a storage unit tracks the reduction and charges less, so the meter hardly
+#   moves at all
+#
+# The upward probe has to be paid for - every watt it tests goes into the
+# neighbour's battery if the suspicion was right. The dip only costs the
+# export we withhold for the settling period, which we were not getting
+# credit for anyway while the cap was in place.
+NEG_DIP = int(os.getenv("NEG_DIP", "150"))
 
 SURPLUS_ENTER_W = int(os.getenv("SURPLUS_ENTER_W", "100"))
 SURPLUS_ENTER_S = int(os.getenv("SURPLUS_ENTER_S", "120"))
@@ -313,6 +358,16 @@ VERIFY_DELAY = 6           # s before a switch command is read back
 # without complaint and leaves the output dead. Measured on 11.09.: discharge
 # stop at 15 %, output and control both came back at 20 %.
 OFFGRID_SOC_MARGIN = int(os.getenv("OFFGRID_SOC_MARGIN", "5"))
+# How long the output may read 0 A while DP 119 says it is enabled, before
+# that is reported. Long enough to ride out the seconds between the switch
+# command and the current actually starting to flow.
+OFFGRID_MISMATCH_S = int(os.getenv("OFFGRID_MISMATCH_S", "60"))
+# How often a dead output is mentioned again while it stays dead. Switching
+# the outlet on at sunrise on an empty battery leaves it locked out for hours,
+# and a single message that morning is easy to miss. 0 reports only once.
+OFFGRID_REMIND_S = int(os.getenv("OFFGRID_REMIND_S", "14400"))
+# Pause before a crashed background loop is started again.
+WORKER_RESTART_S = int(os.getenv("WORKER_RESTART_S", "15"))
 HEARTBEAT = 9              # s
 TUYA_RECEIVE_TIMEOUT = float(os.getenv("TUYA_RECEIVE_TIMEOUT", "1"))
 TUYA_COMMAND_TIMEOUT = float(os.getenv("TUYA_COMMAND_TIMEOUT", "12"))
@@ -328,7 +383,7 @@ LOG_DPS = int(os.getenv("LOG_DPS", "0"))
 # Datapoints already mapped - used only to label the log.
 DP_NAMES = {
     "102": "SoC", "117": "Mode", "118": "Backflow prevention",
-    "119": "Off-grid socket", "120": "Anti-backflow",
+    "119": "Off-grid outlet", "120": "Anti-backflow",
     "121": "Export limit", "122": "Battery charge limit",
     "123": "SoC max", "124": "SoC min",
     "125": "PV energy today", "126": "PV energy total",
@@ -692,7 +747,7 @@ SENSORS = [
     ("133", "temp2",         "Temperature 2",        "°C",  "temperature", "measurement", 0.1),
     ("140", "offgrid_curr",  "Off-grid current",      "A",   "current",     "measurement", 0.1),
     ("156", "pv_limit",      "PV charge limit",       "W",   "power",       "measurement", 1),
-    # Off-grid socket: runs on a separate path and is NOT included in the AC
+    # Off-grid outlet: runs on a separate path and is NOT included in the AC
     # output (155). DP 142 carries the same value.
     ("141", "offgrid_power", "Off-grid load",       "W",   "power",       "measurement", 1),
     ("135", "offgrid_volt",  "Off-grid voltage",   "V",   "voltage",     "measurement", 0.1),
@@ -727,6 +782,7 @@ class State:
         self.idle_since = 0.0      # last seen idle
         self.offgrid_reported = False
         self.offgrid_since = 0.0   # since when is the output dead?
+        self.offgrid_last_report = 0.0
         self.fault_reported = None  # DP 149 value last reported as an event
         self.pass_on = False       # pass-through enabled?
         self.pass_active = False   # pass-through running right now?
@@ -748,6 +804,9 @@ class State:
         self.neighbour_power = None   # neighbouring battery, W
         self.neighbour_ts = 0.0
         self.phases = [None, None, None]   # smoothed, W per phase
+        self.target_ref = METER_TARGET_REF
+        self.phase_ref_warned = False
+        self.phase_ref_active = False
         self.phase_sum = None       # smoothed balanced total, W
         self.phase_ts = 0.0
         self.ep_phase = int(os.getenv("EP_PHASE", "1"))   # 1..3
@@ -761,6 +820,10 @@ class State:
         self.neg_probe_limit = None  # export limit before the step
         self.neg_cap = None         # export ceiling a failed probe imposed
         self.neg_cap_at = 0.0       # when that ceiling was imposed
+        self.neg_dip_at = 0.0       # running dip test
+        self.neg_dip_sum = None     # smoothed sum before the dip
+        self.neg_dip_out = None     # DP 155 before the dip
+        self.neg_dip_limit = None   # export limit before the dip
         self.setpoint = 0.0            # internal setpoint: >0 export, <0 charge
         self.events = []           # event list for the dashboard
         self.last_status = None    # previous device status (for events)
@@ -774,6 +837,7 @@ class State:
         self.shelly2_power = None
         self.shelly2_on = None
         self.shelly2_fails = 0
+        self.shelly2_powered = True
         self.ac_storage1_ip = AC_STORAGE1_IP
         self.ac_storage1_power = None
         self.ac_storage1_on = None
@@ -940,10 +1004,10 @@ def publish_discovery(client):
         "device": DEVICE_INFO,
     }), retain=True)
 
-    # Off-grid socket on the device (DP 119). It wakes the inverter from
+    # Off-grid outlet on the device (DP 119). It wakes the inverter from
     # standby, so it costs idle power even with nothing plugged in.
     client.publish(f"{DISC}/switch/ep2500/offgrid/config", json.dumps({
-        "name": "Off-grid socket",
+        "name": "Off-grid outlet",
         "unique_id": "ep2500_offgrid",
         "state_topic": f"{BASE}/state",
         "value_template": "{{ 'ON' if value_json.offgrid else 'OFF' }}",
@@ -984,7 +1048,7 @@ def publish_discovery(client):
 
     # Second Shelly, for example on a north-facing balcony PV system
     client.publish(f"{DISC}/sensor/ep2500/shelly2/config", json.dumps({
-        "name": "North PV power",
+        "name": "Shelly on Off-Grid power",
         "unique_id": "ep2500_shelly2",
         "state_topic": f"{BASE}/shelly2",
         "value_template": "{{ value_json.power }}",
@@ -996,7 +1060,7 @@ def publish_discovery(client):
     }), retain=True)
 
     client.publish(f"{DISC}/switch/ep2500/shelly2/config", json.dumps({
-        "name": "North PV",
+        "name": "Shelly on Off-Grid",
         "unique_id": "ep2500_shelly2_switch",
         "state_topic": f"{BASE}/shelly2",
         "value_template": "{{ value_json.state }}",
@@ -1008,7 +1072,7 @@ def publish_discovery(client):
     }), retain=True)
 
     client.publish(f"{DISC}/text/ep2500/shelly2_ip/config", json.dumps({
-        "name": "North PV Shelly IP",
+        "name": "Shelly IP on Off-Grid",
         "unique_id": "ep2500_shelly2_ip",
         "state_topic": f"{BASE}/shelly2_ip",
         "command_topic": f"{BASE}/shelly2_ip/set",
@@ -1128,6 +1192,18 @@ def publish_discovery(client):
             "availability_topic": f"{BASE}/available",
             "device": DEVICE_INFO,
         }), retain=True)
+
+    client.publish(f"{DISC}/select/ep2500/target_ref/config", json.dumps({
+        "name": "Meter target follows",
+        "unique_id": "ep2500_target_ref",
+        "state_topic": f"{BASE}/target_ref",
+        "command_topic": f"{BASE}/target_ref/set",
+        "options": ["Automatic", "Balanced sum", "Own phase"],
+        "icon": "mdi:scale-balance",
+        "entity_category": "config",
+        "availability_topic": f"{BASE}/available",
+        "device": DEVICE_INFO,
+    }), retain=True)
 
     client.publish(f"{DISC}/select/ep2500/phase/config", json.dumps({
         "name": "EP2500 phase",
@@ -1342,7 +1418,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
               f"{BASE}/shelly2_ip/set", f"{BASE}/shelly2/set",
               f"{BASE}/ac_storage1_ip/set", f"{BASE}/ac_storage1/set",
               f"{BASE}/ac_storage2_ip/set", f"{BASE}/ac_storage2/set",
-              f"{BASE}/phase/set", f"{BASE}/backup/set",
+              f"{BASE}/phase/set", f"{BASE}/target_ref/set",
+              f"{BASE}/backup/set",
               f"{BASE}/backup/power/set", f"{BASE}/surplus/set",
               f"{BASE}/offgrid/set", f"{BASE}/record/set"):
         client.subscribe(t)
@@ -1362,6 +1439,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{BASE}/ac_storage1_ip")
     client.subscribe(f"{BASE}/ac_storage2_ip")
     client.subscribe(f"{BASE}/phase")
+    client.subscribe(f"{BASE}/target_ref")
     client.subscribe(f"{BASE}/backup/power")
     client.subscribe(f"{BASE}/surplus/state")
     if NEIGHBOUR_TOPIC:
@@ -1389,6 +1467,9 @@ def publish_settings():
         ip = getattr(st, f"{key}_ip")
         if f"{key}_ip" not in st.restored and ip:
             mqttc.publish(f"{BASE}/{key}_ip", ip, retain=True)
+    if "target_ref" not in st.restored:
+        mqttc.publish(f"{BASE}/target_ref",
+                      TARGET_REF_LABEL[st.target_ref], retain=True)
     if "phase" not in st.restored:
         mqttc.publish(f"{BASE}/phase", str(st.ep_phase), retain=True)
     if "backup_power" not in st.restored:
@@ -1411,7 +1492,7 @@ def publish_settings():
     log.info("Controller parameters: %s", st.tune)
     # When reading logs it helps to see which addresses actually arrived - on
     # environment variable that never made it is otherwise easy to miss.
-    log.info("Shelly addresses: mains disconnect=%r  north PV=%r  "
+    log.info("Shelly addresses: mains disconnect=%r  on off-grid=%r  "
              "AC storage 1=%r  AC storage 2=%r",
              st.shelly_ip or "(empty)", st.shelly2_ip or "(empty)",
              st.ac_storage1_ip or "(empty)", st.ac_storage2_ip or "(empty)")
@@ -1498,14 +1579,14 @@ def on_message(client, userdata, msg):
         # Publish retained like the first address, otherwise the entry is
         # gone again after the next restart.
         client.publish(f"{BASE}/shelly2_ip", st.shelly2_ip, retain=True)
-        event(f"North PV Shelly address changed to {st.shelly2_ip}")
+        event(f"Shelly on Off-Grid: address changed to {st.shelly2_ip}")
         return
 
     if topic == f"{BASE}/shelly2_ip":
         if "shelly2_ip" not in st.restored and payload:
             st.shelly2_ip = payload
             st.restored.add("shelly2_ip")
-            log.info("North PV Shelly address %s (restored)", payload)
+            log.info("Shelly on Off-Grid: address %s (restored)", payload)
         return
 
     if topic == f"{BASE}/shelly/set":
@@ -1576,6 +1657,21 @@ def on_message(client, userdata, msg):
             with st.lock:
                 st.neighbour_power = float(value)
                 st.neighbour_ts = time.time()
+        return
+
+    if topic in (f"{BASE}/target_ref/set", f"{BASE}/target_ref"):
+        choice = payload.strip().lower()
+        wanted = ("own_phase" if choice.startswith("own")
+                  else "auto" if choice.startswith("auto") else "sum")
+        if topic.endswith("/set"):
+            st.target_ref = wanted
+            st.restored.add("target_ref")
+            client.publish(f"{BASE}/target_ref", TARGET_REF_LABEL[wanted],
+                           retain=True)
+            event(f"Meter target reference set to {TARGET_REF_LABEL[wanted]}")
+        elif "target_ref" not in st.restored and payload:
+            st.target_ref = wanted
+            st.restored.add("target_ref")
         return
 
     if topic == f"{BASE}/phase/set":
@@ -1692,7 +1788,7 @@ def on_message(client, userdata, msg):
         if ok:
             st.merge({DP_OFFGRID: on})
         if ok:
-            event("Off-grid socket "
+            event("Off-grid outlet "
                   + ("switched on" if on else "switched off"))
             # No prediction here. Whether the output really comes up is
             # something only DP 140 can answer, and offgrid_watch_loop checks
@@ -1705,11 +1801,11 @@ def on_message(client, userdata, msg):
             # The cache now holds the requested value. Whether the device
             # really took it only shows on a read-back.
             threading.Timer(VERIFY_DELAY, verify_switch,
-                            (DP_OFFGRID, on, "Off-grid socket")).start()
+                            (DP_OFFGRID, on, "Off-grid outlet")).start()
         else:
             # This event used to be raised on a rejection too - the log then
             # claimed a switching action that never happened.
-            log.warning("Off-grid socket rejected: %s", reason_txt)
+            log.warning("Off-grid outlet rejected: %s", reason_txt)
             event(f"Switching off-grid socket failed: {reason_txt}")
         publish_state()
         return
@@ -1771,7 +1867,7 @@ def on_message(client, userdata, msg):
             st.restored.add("correction")
             client.publish(f"{BASE}/correction/state", st.correction, retain=True)
             st.neg_cap, st.neg_probe_at, st.neg_probe_limit = None, 0.0, None
-            st.neg_cap_at = 0.0
+            st.neg_cap_at = st.neg_dip_at = 0.0
             log.info("Meter target = %s W", st.correction)
             event(f"Meter target set to {st.correction:+d} W")
 
@@ -1996,6 +2092,7 @@ def publish_state():
             value = st.phases[nr - 1]
             out[f"phase{nr}"] = round(value) if value is not None else None
         out["ep_phase"] = st.ep_phase
+    out["target_ref"] = st.target_ref
     other = own_phase_load(dps)
     out["own_phase_load"] = round(other) if other is not None else None
     out["backup"] = st.backup_on
@@ -2138,6 +2235,22 @@ def log_phases():
              "own L%d, others %s",
              values[0], values[1], values[2], total, phase,
              "?" if other is None else f"{other:+.0f} W")
+
+
+def own_phase_reading(now=None):
+    """The smoothed reading of the phase the EP2500 is wired to.
+
+    None when it is missing or stale, so the caller can fall back rather than
+    regulate against a value that stopped moving hours ago.
+    """
+    now = now or time.time()
+    with st.lock:
+        phase = st.ep_phase
+        value = st.phases[phase - 1] if 1 <= phase <= 3 else None
+        age = now - st.phase_ts
+    if value is None or age > GRID_MAX_AGE:
+        return None
+    return value
 
 
 def own_phase_load(dps):
@@ -2300,7 +2413,7 @@ def shelly_slot(nr):
     """Returns the state prefix, label and MQTT topic for one Shelly slot."""
     slots = {
         1: ("shelly", "Shelly"),
-        2: ("shelly2", "Shelly north PV"),
+        2: ("shelly2", "Shelly on Off-Grid"),
         3: ("ac_storage1", "Shelly at AC storage 1"),
         4: ("ac_storage2", "Shelly at AC storage 2"),
     }
@@ -2353,8 +2466,38 @@ def shelly_poll(nr):
 def shelly_loop(nr):
     """Polls one Shelly independently so a failed unit delays no other."""
     while True:
+        if not shelly_powered(nr):
+            # Skip quietly. A plug fed from the off-grid outlet is gone
+            # whenever the outlet is, and reporting that every five seconds
+            # buries the failures that do mean something: one night produced
+            # 75 warnings, all of them expected.
+            time.sleep(SHELLY_INTERVAL)
+            continue
         shelly_poll(nr)
         time.sleep(SHELLY_INTERVAL)
+
+
+def shelly_powered(nr):
+    """Can this plug have power at all right now?"""
+    if nr != 2 or not SHELLY2_ON_OFFGRID:
+        return True
+    current = st.snapshot().get("140")
+    if not isinstance(current, (int, float)):
+        return True          # no reading: poll rather than guess
+    live = current > 0
+    if live != st.shelly2_powered:
+        st.shelly2_powered = live
+        if live:
+            st.shelly2_fails = 0
+            log.info("Shelly on Off-Grid: outlet is live again, polling resumes")
+        else:
+            with st.lock:
+                st.shelly2_power = None
+                st.shelly2_on = None
+            mqttc.publish(f"{BASE}/shelly2", json.dumps(
+                {"power": None, "state": None, "ip": st.shelly2_ip}))
+            log.info("Shelly on Off-Grid: outlet is off, polling paused")
+    return live
 
 
 def shelly_switch(on, nr=1):
@@ -2414,17 +2557,25 @@ def offgrid_watch_loop():
         if not st.offgrid_since:
             st.offgrid_since = time.time()
             continue
-        if (not st.offgrid_reported
-                and time.time() - st.offgrid_since > OFFGRID_MISMATCH_S):
+        now = time.time()
+        due = (not st.offgrid_reported
+               and now - st.offgrid_since > OFFGRID_MISMATCH_S)
+        if (st.offgrid_reported and OFFGRID_REMIND_S
+                and now - st.offgrid_last_report >= OFFGRID_REMIND_S):
+            due = True
+        if due:
             st.offgrid_reported = True
+            st.offgrid_last_report = now
             locked, soc, threshold = offgrid_locked(dps)
+            waited = int((now - st.offgrid_since) / 60)
+            since = f" (for {waited} min now)" if waited >= 5 else ""
             if locked:
-                event(f"Off-grid output enabled but dead - state of charge "
-                      f"{soc} %, the device usually releases it around "
-                      f"{threshold} %")
+                event(f"Off-grid output enabled but dead{since} - state of "
+                      f"charge {soc} %, the device usually releases it "
+                      f"around {threshold} %")
             else:
-                event("Off-grid output enabled but no current is flowing "
-                      "(DP 140 at 0)")
+                event(f"Off-grid output enabled but no current is "
+                      f"flowing{since} (DP 140 at 0)")
 
 
 def charge_guard_loop():
@@ -2566,7 +2717,8 @@ def probe_verdict(meter_now, draw_now, now=None):
     return "compensated", detail
 
 
-def negative_target_guard(setpoint, limit, actual, now=None):
+def negative_target_guard(setpoint, limit, actual, now=None,
+                          reference=None):
     """Keeps a negative meter target from feeding a neighbouring battery.
 
     Mirror of the surplus probe. Raising export is a probe: afterwards the
@@ -2577,8 +2729,14 @@ def negative_target_guard(setpoint, limit, actual, now=None):
     Lowering is always allowed and never waits.
     """
     now = now or time.time()
-    with st.lock:
-        smoothed = st.phase_sum
+    if reference is not None:
+        # Probe and dip have to measure whatever the controller is steering.
+        # Judging the balanced sum while regulating one phase would compare
+        # two different things and reach a verdict about neither.
+        smoothed = reference
+    else:
+        with st.lock:
+            smoothed = st.phase_sum
 
     if st.neg_probe_at and now - st.neg_probe_at >= PROBE_SETTLE:
         st.neg_probe_at = 0.0
@@ -2608,17 +2766,56 @@ def negative_target_guard(setpoint, limit, actual, now=None):
                     event("Negative meter target released - the meter is "
                           "following again")
 
+    # A dip in flight has to be judged before anything else.
+    if st.neg_dip_at and now - st.neg_dip_at >= PROBE_SETTLE:
+        st.neg_dip_at = 0.0
+        usable = (st.neg_dip_sum is not None and st.neg_dip_out is not None
+                  and isinstance(smoothed, (int, float))
+                  and isinstance(actual, (int, float)))
+        if usable:
+            withheld = st.neg_dip_out - actual    # >0: we export less now
+            moved = smoothed - st.neg_dip_sum     # >0: meter went to import
+            if withheld >= PROBE_MIN_DRAW:
+                share = moved / withheld
+                if share >= PROBE_ACCEPT:
+                    st.neg_cap = None
+                    st.neg_cap_at = 0.0
+                    event(f"Negative meter target released - held back "
+                          f"{withheld:.0f} W and the meter followed by "
+                          f"{moved:.0f} W ({share * 100:.0f} %), so this is a "
+                          f"real load and not a storage unit")
+                else:
+                    st.neg_cap_at = now
+                    event(f"Negative meter target still capped - held back "
+                          f"{withheld:.0f} W but the meter only moved "
+                          f"{moved:.0f} W ({share * 100:.0f} %), so something "
+                          f"is still tracking us")
+            else:
+                st.neg_cap_at = now
+
     if st.neg_cap is not None:
+        if st.neg_dip_at:
+            # Dip running: hold the reduced value, do not let the controller
+            # pull it back up while we are measuring.
+            return max(0.0, st.neg_cap - NEG_DIP)
         if now - st.neg_cap_at >= NEG_RETRY:
-            st.neg_cap = None
-            event("Negative meter target: testing again whether the export "
-                  "now reaches the meter")
-        else:
-            setpoint = min(setpoint, st.neg_cap)
+            st.neg_dip_sum, st.neg_dip_out = smoothed, actual
+            st.neg_dip_limit = float(limit)
+            st.neg_dip_at = now
+            log.info("Negative meter target: dipping export by %s W to see "
+                     "whether the consumer follows", NEG_DIP)
+            return max(0.0, float(limit) - NEG_DIP)
+        setpoint = min(setpoint, st.neg_cap)
 
     if st.neg_probe_at:
         # A probe is settling: hold, do not raise further.
         return min(setpoint, float(limit))
+    if st.neg_cap is not None and setpoint <= st.neg_cap:
+        # Moving back up to a level that was already reached is not a probe.
+        # Without this the return from a dip counts as an increase, fails its
+        # own verification, and lowers the cap - so every dip would ratchet
+        # the ceiling further down instead of leaving it where it was.
+        return setpoint
     if setpoint > limit + CTRL_MIN_STEP:
         setpoint = min(setpoint, limit + NEG_PROBE_STEP)
         st.neg_probe_sum, st.neg_probe_out = smoothed, actual
@@ -3229,15 +3426,50 @@ def control_loop():
         # lower clamp undid the correction that had just been made. Observed:
         # at a meter deviation of -15 W the setpoint jumped from 432 to 720 W
         # because "actual" still read 795 W.
+        # A non-zero target may be regulated against the device's own phase
+        # instead of the balanced sum. Everything downstream - controller,
+        # probe and cap - then works on that same reading, so they stay
+        # consistent with each other.
+        control_value, control_name = grid, "meter"
+        use_phase = st.target_ref == "own_phase"
+        if st.target_ref == "auto" and isinstance(soc, (int, float)):
+            # "Full" means the pass-through threshold, not the charge stop -
+            # the device must never actually reach 100 %, so that is the only
+            # sensible reading of full here.
+            use_phase = soc >= st.tune["soc_pass"]
+        if use_phase != st.phase_ref_active:
+            st.phase_ref_active = use_phase
+            if st.target_ref == "auto" and requested_target != 0:
+                event(f"Meter target now follows "
+                      + (f"phase L{st.ep_phase} - battery at {soc} %, "
+                         f"local loads on that phase are compensated"
+                         if use_phase else
+                         f"the balanced sum again - battery at {soc} %"))
+        if requested_target != 0 and use_phase:
+            phase_value = own_phase_reading()
+            if phase_value is None:
+                if not st.phase_ref_warned:
+                    st.phase_ref_warned = True
+                    event("Meter target follows the own phase, but no fresh "
+                          "phase reading is available - falling back to the "
+                          "balanced sum")
+            else:
+                st.phase_ref_warned = False
+                control_value, control_name = phase_value, f"L{st.ep_phase}"
+
         max_step = st.tune["max_step"]
-        setpoint = calculate_setpoint(grid, target, actual, st.setpoint,
-                                      st.tune["gain"], max_step)
+        setpoint = calculate_setpoint(control_value, target, actual,
+                                      st.setpoint, st.tune["gain"], max_step)
 
         if requested_target < 0:
-            setpoint = negative_target_guard(setpoint, limit, actual)
-        elif st.neg_cap is not None or st.neg_probe_at:
+            setpoint = negative_target_guard(setpoint, limit, actual,
+                                             reference=control_value)
+        elif st.neg_cap is not None or st.neg_probe_at or st.neg_dip_at:
+            # A dip in flight also has to be cleared. Observed on 14.09.: the
+            # target was set back to 0 thirteen seconds into a dip. It was
+            # cleared here only because a cap happened to be set as well.
             st.neg_cap, st.neg_probe_at, st.neg_probe_limit = None, 0.0, None
-            st.neg_cap_at = 0.0
+            st.neg_cap_at = st.neg_dip_at = 0.0
 
         # Store what the controller is really going to use. Saving the value
         # from before the guard would both mislead the dashboard and give the
@@ -3248,10 +3480,37 @@ def control_loop():
         if abs(new - limit) < CTRL_MIN_STEP:
             continue
 
-        log.info("Meter %+.0f W (target %+.0f) | actual %.0f W | "
-                 "export %s -> %s", grid, target, actual, limit, new)
+        log.info("%s %+.0f W (target %+.0f) | actual %.0f W | export %s -> %s",
+                 control_name.capitalize(), control_value, target, actual,
+                 limit, new)
         set_limit(new, reason="control")
         publish_state()
+
+
+def start_worker(target, *args):
+    """Starts a background loop that reports and survives its own crashes.
+
+    Every loop here runs forever in its own thread. When one raises, Python
+    prints a traceback and the thread simply ends - the rest of the bridge
+    carries on as if nothing happened. That is how a typo in the off-grid
+    watchdog went unnoticed: the watchdog was gone for a day while everything
+    else looked healthy.
+
+    A crash is now an event, and the loop restarts after a pause.
+    """
+    name = target.__name__
+
+    def wrapper():
+        while True:
+            try:
+                target(*args)
+                log.warning("%s returned unexpectedly, restarting", name)
+            except Exception as exc:
+                log.exception("%s crashed", name)
+                event(f"Internal error in {name}: {exc} - restarting it")
+            time.sleep(WORKER_RESTART_S)
+
+    threading.Thread(target=wrapper, name=name, daemon=True).start()
 
 
 def main():
@@ -3272,12 +3531,12 @@ def main():
     mqttc.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
     mqttc.loop_start()
 
-    threading.Thread(target=tuya_loop, daemon=True).start()
-    threading.Thread(target=control_loop, daemon=True).start()
-    threading.Thread(target=charge_guard_loop, daemon=True).start()
-    threading.Thread(target=offgrid_watch_loop, daemon=True).start()
+    start_worker(tuya_loop)
+    start_worker(control_loop)
+    start_worker(charge_guard_loop)
+    start_worker(offgrid_watch_loop)
     for nr in (1, 2, 3, 4):
-        threading.Thread(target=shelly_loop, args=(nr,), daemon=True).start()
+        start_worker(shelly_loop, nr)
     if GRID_SOURCE == "mqtt":
         log.warning("GRID_SOURCE=mqtt supplies the balanced total only. The "
                     "per-phase readings come from the Eco Tracker's HTTP "
@@ -3288,12 +3547,12 @@ def main():
         log.warning("REC_HOST is not set - recordings still work, but the "
                     "dashboard cannot offer a download link. Set it to the "
                     "address of this machine, port %s.", REC_PORT)
-    threading.Thread(target=record_server_loop, daemon=True).start()
-    threading.Thread(target=record_info_loop, daemon=True).start()
+    start_worker(record_server_loop)
+    start_worker(record_info_loop)
 
     if GRID_SOURCE == "http":
         log.info("Meter source: HTTP %s (field %s)", ECO_URL, ECO_FIELD)
-        threading.Thread(target=eco_loop, daemon=True).start()
+        start_worker(eco_loop)
     else:
         log.info("Meter source: MQTT %s", GRID_TOPIC)
 

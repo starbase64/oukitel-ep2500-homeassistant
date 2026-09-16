@@ -53,8 +53,7 @@ views:
                     name: Meter
                   - entity: sensor.oukitel_ep2500_shelly_power
                     name: Shelly
-                  - entity: sensor.oukitel_ep2500_north_pv_power
-                    name: North PV
+    
               - type: glance
                 title: Meter phases
                 columns: 4
@@ -165,8 +164,8 @@ views:
                 name: Pass-through running now
               - entity: switch.oukitel_ep2500_backflow_prevention
                 name: Backflow prevention (blocks export)
-              - entity: switch.oukitel_ep2500_off_grid_socket
-                name: Off-grid socket (permission)
+              - entity: switch.oukitel_ep2500_off_grid_outlet
+                name: Off-grid outlet (permission)
               - entity: binary_sensor.oukitel_ep2500_off_grid_output_live
                 name: '  actually delivering'
               - entity: input_boolean.ep2500_offgrid_night_off
@@ -177,10 +176,12 @@ views:
                 name: Shelly at the EP2500 (mains disconnect)
               - entity: text.oukitel_ep2500_shelly_ip
                 name: '  Shelly IP'
-              - entity: switch.oukitel_ep2500_north_pv
-                name: Shelly at the second PV system
-              - entity: text.oukitel_ep2500_north_pv_shelly_ip
+              - entity: switch.oukitel_ep2500_shelly_on_off_grid
+                name: Shelly on Off-Grid
+              - entity: text.oukitel_ep2500_shelly_ip_on_off_grid
                 name: '  Shelly IP'
+              - entity: sensor.oukitel_ep2500_shelly_on_off_grid_power
+                name: '  power'
               - entity: switch.oukitel_ep2500_shelly_at_ac_storage_1
                 name: Shelly at AC storage 1
               - entity: text.oukitel_ep2500_shelly_ip_at_ac_storage_1
@@ -212,6 +213,8 @@ views:
               - type: divider
               - entity: number.oukitel_ep2500_meter_target
                 name: Meter target (+ import / - export)
+              - entity: select.oukitel_ep2500_meter_target_follows
+                name: '  target follows'
               - type: divider
               - entity: number.oukitel_ep2500_charge_stop
                 name: Charge stop (SoC max)
