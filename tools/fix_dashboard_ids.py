@@ -35,6 +35,7 @@ UID = {
     "number.oukitel_ep2500_discharge_stop": "ep2500_socmin",
     "number.oukitel_ep2500_export_limit": "ep2500_limit",
     "number.oukitel_ep2500_max_step": "ep2500_tune_max_step",
+    "number.oukitel_ep2500_export_limit_max": "ep2500_tune_limit_max",
     "number.oukitel_ep2500_meter_target": "ep2500_correction",
     "number.oukitel_ep2500_pass_through_from_soc": "ep2500_tune_soc_pass",
     "number.oukitel_ep2500_pv_limit_when_open": "ep2500_tune_pv_max",
