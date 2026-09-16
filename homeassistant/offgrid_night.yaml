@@ -1,7 +1,7 @@
-# Switch the EP2500 off-grid socket off between sunset and sunrise.
+# Switch the EP2500 off-grid outlet off between sunset and sunrise.
 #
 # Copy-paste source. The reasoning, the measurement behind it and the
-# pitfalls are in docs/setup.md, section "The off-grid socket".
+# pitfalls are in docs/setup.md, section "The off-grid outlet".
 #
 # Append these automations to automations.yaml. The separate helper is in
 # input_boolean.yaml; include that file from configuration.yaml if needed.
@@ -15,7 +15,7 @@
 # tools/fix_dashboard_ids.py to see the mapping your install uses.
 
 - id: ep2500_offgrid_sunset
-  alias: EP2500 - off-grid socket off at sunset
+  alias: EP2500 - off-grid outlet off at sunset
   description: >-
     Saves the inverter's standby draw for an empty socket overnight.
   mode: single
@@ -33,10 +33,10 @@
     - action: logbook.log
       data:
         name: EP2500
-        message: Off-grid socket switched off at sunset.
+        message: Off-grid outlet switched off at sunset.
 
 - id: ep2500_offgrid_sunrise
-  alias: EP2500 - off-grid socket on at sunrise
+  alias: EP2500 - off-grid outlet on at sunrise
   description: >-
     Restores the socket in the morning while night switching is enabled.
   mode: single
@@ -54,10 +54,10 @@
     - action: logbook.log
       data:
         name: EP2500
-        message: Off-grid socket switched on at sunrise.
+        message: Off-grid outlet switched on at sunrise.
 
 - id: ep2500_offgrid_apply_now
-  alias: EP2500 - align off-grid socket when the helper changes
+  alias: EP2500 - align off-grid outlet when the helper changes
   description: >-
     Without this one, switching the helper on after sunset does nothing until
     the next evening, which looks like a broken switch.
@@ -78,7 +78,7 @@
         entity_id: switch.oukitel_ep2500_off_grid_socket
 
 - id: ep2500_offgrid_helper_off
-  alias: EP2500 - restore off-grid socket when night switch is disabled
+  alias: EP2500 - restore off-grid outlet when night switch is disabled
   description: >-
     Prevents the socket from remaining off after disabling the helper at night.
   mode: single
