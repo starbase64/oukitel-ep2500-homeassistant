@@ -57,7 +57,9 @@ DISC = "homeassistant"
 GRID_SOURCE = os.getenv("GRID_SOURCE", "http").lower()
 
 ECO_URL = os.getenv("ECO_URL", "http://192.168.1.100/status")
-ECO_FIELD = os.getenv("ECO_FIELD", "power")        # oder "powerAvg"
+# Dotted path into the reply, e.g. "power", "powerAvg", or "Power.Power" for
+# a nested smart meter JSON such as {"Power": {"Power": 1101}}.
+ECO_FIELD = os.getenv("ECO_FIELD", "power")
 ECO_INTERVAL = int(os.getenv("ECO_INTERVAL", "5"))  # s
 
 # Plausibility check: a jump larger than ECO_SPIKE watts against the previous
@@ -101,6 +103,7 @@ BATT_WH = int(os.getenv("BATT_WH", "2048"))
 ECO_ABSURD = 30000          # W; beyond this it is not a reading
 
 GRID_TOPIC = os.getenv("GRID_TOPIC", "ecotracker/power")
+# Dotted path for nested payloads, e.g. "Power.Power".
 GRID_JSON_KEY = os.getenv("GRID_JSON_KEY", "power")
 GRID_MAX_AGE = 60          # s; older meter readings count as invalid
 
@@ -1895,8 +1898,34 @@ def apply_tune(key, payload, source="", echo=True):
     return True
 
 
+def get_nested_value(data, path):
+    """Resolves a dotted path such as 'Power.Power' against JSON data.
+
+    A path without a dot is just a flat key, so plain ECO_FIELD/GRID_JSON_KEY
+    configurations keep working unchanged. Numeric path segments also index
+    into lists. Returns None wherever the path does not match the data.
+    """
+    node = data
+    for part in path.split("."):
+        if isinstance(node, dict):
+            if part not in node:
+                return None
+            node = node[part]
+        elif isinstance(node, list):
+            if not part.lstrip("-").isdigit():
+                return None
+            idx = int(part)
+            if not -len(node) <= idx < len(node):
+                return None
+            node = node[idx]
+        else:
+            return None
+    return node
+
+
 def parse_number(payload, json_key=None):
-    """Accepts '812', '812.0' or {'power': 812}.
+    """Accepts '812', '812.0' or {'power': 812} - json_key may be a dotted
+    path such as 'Power.Power' to reach a nested field.
 
     NaN and infinity are rejected - a later int() would otherwise raise and
     abort the control step.
@@ -1908,9 +1937,11 @@ def parse_number(payload, json_key=None):
         pass
     try:
         data = json.loads(payload)
-        if json_key and isinstance(data, dict) and json_key in data:
-            value = float(data[json_key])
-            return value if math.isfinite(value) else None
+        if json_key:
+            value = get_nested_value(data, json_key)
+            if value is not None:
+                value = float(value)
+                return value if math.isfinite(value) else None
     except Exception:
         pass
     log.warning("Unreadable payload: %r", payload[:80])
@@ -2345,7 +2376,7 @@ def eco_loop():
             with urllib.request.urlopen(ECO_URL, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
 
-            val = data.get(ECO_FIELD)
+            val = get_nested_value(data, ECO_FIELD)
             if val is None:
                 raise ValueError(f"field {ECO_FIELD!r} missing from the reply")
 

@@ -26,11 +26,11 @@ anything has been stored.
 |---|---|---|
 | `GRID_SOURCE` | `http` | `http` (Eco Tracker endpoint, needed for the phases) or `mqtt` |
 | `ECO_URL` | `http://192.168.1.100/status` | meter endpoint when `GRID_SOURCE=http` |
-| `ECO_FIELD` | `power` | field in that reply, e.g. `power` or `powerAvg` |
+| `ECO_FIELD` | `power` | field in that reply, e.g. `power`, `powerAvg`, or a dotted path like `Power.Power` for a nested reply |
 | `ECO_INTERVAL` | `5` | seconds between meter reads |
 | `ECO_SPIKE` | `600` | W; a jump larger than this waits for confirmation. 0 disables |
 | `GRID_TOPIC` | `ecotracker/power` | MQTT topic when `GRID_SOURCE=mqtt` |
-| `GRID_JSON_KEY` | `power` | field inside that payload |
+| `GRID_JSON_KEY` | `power` | field inside that payload, also accepts a dotted path like `Power.Power` |
 | `GRID_FAIL_LIMIT` | `0` | W; export limit while the meter is silent |
 
 ## Limits
