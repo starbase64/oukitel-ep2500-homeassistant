@@ -22,6 +22,8 @@ services:
       # --- grid meter -------------------------------------------------
       # "http" polls a meter directly, "mqtt" reads from GRID_TOPIC.
       # Expects power in watts: positive = importing, negative = exporting.
+      # ECO_FIELD/GRID_JSON_KEY accept a dotted path for nested replies,
+      # e.g. "Power.Power" for {"Power": {"Power": 1101}}.
       GRID_SOURCE:  "http"
       ECO_URL:      "http://192.168.1.100/status"
       ECO_FIELD:    "power"
