@@ -25,6 +25,11 @@ services:
       GRID_SOURCE:  "http"
       ECO_URL:      "http://192.168.1.100/status"
       ECO_FIELD:    "power"
+      # Field names for the per-phase readings; defaults match the Eco
+      # Tracker. For a Shelly Pro 3EM see "Other meters" in
+      # docs/configuration.md.
+      # ECO_SUM_FIELD:    "power"
+      # ECO_PHASE_FIELDS: "powerPhase1,powerPhase2,powerPhase3"
       ECO_INTERVAL: "5"
       ECO_SPIKE:    "600"
       # GRID_TOPIC:    "meter/power"

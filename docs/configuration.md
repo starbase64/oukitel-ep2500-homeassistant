@@ -24,14 +24,37 @@ anything has been stored.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GRID_SOURCE` | `http` | `http` (Eco Tracker endpoint, needed for the phases) or `mqtt` |
+| `GRID_SOURCE` | `http` | `http` (polls a meter's JSON endpoint, needed for the phases) or `mqtt` |
 | `ECO_URL` | `http://192.168.1.100/status` | meter endpoint when `GRID_SOURCE=http` |
 | `ECO_FIELD` | `power` | field in that reply, e.g. `power` or `powerAvg` |
+| `ECO_SUM_FIELD` | `power` | instantaneous balanced sum in that reply, used with the phases |
+| `ECO_PHASE_FIELDS` | `powerPhase1,powerPhase2,powerPhase3` | the three per-phase fields, comma-separated, in L1-L3 order |
 | `ECO_INTERVAL` | `5` | seconds between meter reads |
 | `ECO_SPIKE` | `600` | W; a jump larger than this waits for confirmation. 0 disables |
 | `GRID_TOPIC` | `ecotracker/power` | MQTT topic when `GRID_SOURCE=mqtt` |
 | `GRID_JSON_KEY` | `power` | field inside that payload |
 | `GRID_FAIL_LIMIT` | `0` | W; export limit while the meter is silent |
+
+All fields must be top-level keys of the JSON reply. The defaults match the
+Eco Tracker. Per-phase readings (phase sensors, "own phase" meter target, AC
+surplus charging) need `ECO_SUM_FIELD` and all three `ECO_PHASE_FIELDS` to be
+present; otherwise the bridge still regulates on `ECO_FIELD` alone.
+
+### Other meters over HTTP
+
+**Shelly Pro 3EM** (Gen2+, triphase profile), no authentication:
+
+```yaml
+GRID_SOURCE:      "http"
+ECO_URL:          "http://<shelly-ip>/rpc/EM.GetStatus?id=0"
+ECO_FIELD:        "total_act_power"
+ECO_SUM_FIELD:    "total_act_power"
+ECO_PHASE_FIELDS: "a_act_power,b_act_power,c_act_power"
+```
+
+Shelly phases A/B/C map to L1/L2/L3. The sign is positive for import as long
+as the CT clamps face the grid; check that the reading goes negative while
+the EP2500 exports more than the house draws.
 
 ## Limits
 

@@ -174,7 +174,17 @@ BACKUP_POWER_DEFAULT = int(os.getenv("BACKUP_POWER", "800"))
 # instantaneous values with one common smoothing filter, so it never compares
 # an averaged sum against an unaveraged phase.
 PHASE_SMOOTH = float(os.getenv("PHASE_SMOOTH", "0.25"))   # EMA weight, 0..1
-PHASE_FIELDS = ("powerPhase1", "powerPhase2", "powerPhase3")
+# Field names in the HTTP reply. Defaults match the Eco Tracker; override them
+# for other meters, e.g. a Shelly Pro 3EM (rpc/EM.GetStatus?id=0):
+#   ECO_SUM_FIELD="total_act_power"
+#   ECO_PHASE_FIELDS="a_act_power,b_act_power,c_act_power"
+ECO_SUM_FIELD = os.getenv("ECO_SUM_FIELD", "power").strip()
+PHASE_FIELDS = tuple(
+    f.strip() for f in os.getenv(
+        "ECO_PHASE_FIELDS", "powerPhase1,powerPhase2,powerPhase3").split(","))
+if len(PHASE_FIELDS) != 3 or not all(PHASE_FIELDS):
+    raise SystemExit("ECO_PHASE_FIELDS needs exactly three comma-separated "
+                     f"field names, got {PHASE_FIELDS!r}")
 # How often the phases land in the log. They go to MQTT continuously, but the
 # recordings are what you read afterwards when working out why the surplus
 # logic did what it did - and without the phases in there, the deciding
@@ -2207,7 +2217,7 @@ def accept_phases(data):
     comparable. Anything implausible is dropped rather than smoothed in.
     """
     values = []
-    for field in ("power",) + PHASE_FIELDS:
+    for field in (ECO_SUM_FIELD,) + PHASE_FIELDS:
         raw = data.get(field)
         if not isinstance(raw, (int, float)) or not math.isfinite(raw):
             return
@@ -3562,7 +3572,8 @@ def main():
     start_worker(record_info_loop)
 
     if GRID_SOURCE == "http":
-        log.info("Meter source: HTTP %s (field %s)", ECO_URL, ECO_FIELD)
+        log.info("Meter source: HTTP %s (field %s, phases %s + %s)", ECO_URL,
+                 ECO_FIELD, ECO_SUM_FIELD, ",".join(PHASE_FIELDS))
         start_worker(eco_loop)
     else:
         log.info("Meter source: MQTT %s", GRID_TOPIC)
